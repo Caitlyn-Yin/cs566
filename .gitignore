@@ -1,0 +1,4 @@
+im2latex100k/formula_images_processed/
+__pycache__/
+*.pyc
+.DS_Store
