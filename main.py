@@ -647,7 +647,8 @@ def main():
         print(f"\tTest Exact Match: {em:.4f}")
 
         # Save a checkpoint
-        torch.save(model.state_dict(), f"im2latex_baseline_epoch_{epoch}.pth")
+        if epoch % 10 == 0:
+            torch.save(model.state_dict(), f"im2latex_baseline_epoch_{epoch}.pth")
 
     print("\nTraining complete.")
     
