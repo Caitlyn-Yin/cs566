@@ -1,5 +1,5 @@
 # Install dependencies:
-# pip install torch torchvision pandas numpy pillow nltk tqdm scikit-learn
+# test upload
 import os
 import re
 import random
