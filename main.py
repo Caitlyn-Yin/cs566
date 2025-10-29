@@ -18,6 +18,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torchvision import models, transforms
 from nltk.translate.bleu_score import corpus_bleu
 
+import time
 # --- Configuration ---
 
 # Set data paths
@@ -29,9 +30,10 @@ IMG_DIR = os.path.join(DATA_DIR, 'formula_images_processed')
 
 # Model & Training Hyperparameters
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 1024
-EPOCHS = 1000
+BATCH_SIZE = 256
+EPOCHS = 100
 LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-5
 CLIP_GRAD = 5.0
 TEACHER_FORCING_RATIO = 0.5
 SEED = 42
@@ -536,6 +538,11 @@ def evaluate(model, loader, criterion, tokenizer):
     # Calculate metrics
     val_loss = epoch_loss / len(loader)
     bleu_score = corpus_bleu(references, hypotheses)
+    # Ensure bleu_score is a float
+    if isinstance(bleu_score, (list, tuple)):
+        bleu_score = float(bleu_score[0]) if bleu_score else 0.0
+    else:
+        bleu_score = float(bleu_score)
     exact_match = exact_match_count / len(loader.dataset)
     
     return val_loss, bleu_score, exact_match
@@ -547,7 +554,7 @@ def main():
     # Load CSV
     try:
         train_df = pd.read_csv(TRAIN_CSV_PATH)
-        val_df = pd.read_csv(VAL_CSV_PATH) # Not used in this baseline
+        val_df = pd.read_csv(VAL_CSV_PATH) 
         test_df = pd.read_csv(TEST_CSV_PATH)
     except FileNotFoundError:
         print(f"Error: Could not find '{TRAIN_CSV_PATH}', '{VAL_CSV_PATH}', or '{TEST_CSV_PATH}'.")
@@ -569,11 +576,13 @@ def main():
     corpus = [normalize_latex(f) for f in train_df['formula']]
     print(len(corpus))
     tokenizer = Tokenizer(min_freq=5)
+    tokenizer.fit(corpus)
     VOCAB_SIZE = tokenizer.vocab_size
     
     
     # Create datasets
     train_dataset = LatexDataset(train_df, IMG_DIR, tokenizer, image_transform)
+    val_dataset = LatexDataset(val_df, IMG_DIR, tokenizer, image_transform)
     test_dataset = LatexDataset(test_df, IMG_DIR, tokenizer, image_transform)
     
     # Create dataloaders
@@ -582,6 +591,14 @@ def main():
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
+        num_workers=4,
+        collate_fn=collate_fn,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
         num_workers=4,
         collate_fn=collate_fn,
         pin_memory=True
@@ -616,10 +633,21 @@ def main():
     model = Im2LatexModel(encoder, decoder).to(DEVICE)
     
     # Optimizer and Loss
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
+
+    # Add a scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='max',  # Monitor BLEU score
+        factor=0.1,  
+        patience=5,  
+    )
     
     print("Starting training...")
+    best_bleu = 0.0
+    epochs_no_improve = 0
+    patience = 10  # Stop after 10 epochs with no improvement
     for epoch in range(1, EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{EPOCHS} ---")
         
@@ -632,18 +660,45 @@ def main():
             TEACHER_FORCING_RATIO
         )
         
-        val_loss, bleu, em = evaluate(
+        val_loss, val_bleu, val_em = evaluate(
             model,
-            test_loader,
+            val_loader,
             criterion,
             tokenizer
         )
+
+        scheduler.step(val_bleu)
         
-        print(f"\nEpoch {epoch} Summary:")
+        # print date and time
+        current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        print(f"[{current_time}] Epoch {epoch} Summary:")
         print(f"\tTrain Loss: {train_loss:.4f}")
-        print(f"\tTest Loss:  {val_loss:.4f}")
-        print(f"\tTest BLEU-4: {bleu:.4f}")
-        print(f"\tTest Exact Match: {em:.4f}")
+        print(f"\tVal Loss:  {val_loss:.4f}")
+        print(f"\tVal BLEU-4: {val_bleu:.4f}")
+        print(f"\tVal Exact Match: {val_em:.4f}")
+
+        if val_bleu > best_bleu:
+            print(f"New best BLEU: {val_bleu:.4f}. Saving model...")
+            best_bleu = val_bleu
+            torch.save(model.state_dict(), "im2latex_best_model.pth")
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            print(f"No improvement for {epochs_no_improve} epochs.")
+
+        if epochs_no_improve >= patience:
+            print(f"Stopping early after {patience} epochs with no improvement.")
+            test_loss, test_bleu, test_em = evaluate(
+                model,
+                test_loader,
+                criterion,
+                tokenizer
+            )
+            print(f"\n--- Test Set Evaluation ---")
+            print(f"Test Loss: {test_loss:.4f}")
+            print(f"Test BLEU-4: {test_bleu:.4f}")
+            print(f"Test Exact Match: {test_em:.4f}")
+            break
 
         # Save a checkpoint
         if epoch % 10 == 0:
