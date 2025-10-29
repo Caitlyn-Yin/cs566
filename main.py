@@ -1,5 +1,4 @@
 # Install dependencies:
-# pip install torch torchvision pandas numpy pillow nltk tqdm scikit-learn
 import os
 import re
 import random
@@ -30,8 +29,8 @@ IMG_DIR = os.path.join(DATA_DIR, 'formula_images_processed')
 
 # Model & Training Hyperparameters
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 32
-EPOCHS = 100
+BATCH_SIZE = 1024
+EPOCHS = 1000
 LEARNING_RATE = 1e-4
 CLIP_GRAD = 5.0
 TEACHER_FORCING_RATIO = 0.5
