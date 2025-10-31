@@ -28,16 +28,23 @@ VAL_CSV_PATH = os.path.join(DATA_DIR, 'im2latex_validate.csv')
 TEST_CSV_PATH = os.path.join(DATA_DIR, 'im2latex_test.csv')
 IMG_DIR = os.path.join(DATA_DIR, 'formula_images_processed')
 
+TRAIN_PT_PATH = os.path.join(DATA_DIR, 'train_processed.pt')
+VAL_PT_PATH = os.path.join(DATA_DIR, 'val_processed.pt')
+TEST_PT_PATH = os.path.join(DATA_DIR, 'test_processed.pt')
+
 # Model & Training Hyperparameters
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 256
 EPOCHS = 100
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 1e-5
+LEARNING_RATE = 1e-3
+DROPOUT = 0.3
+WEIGHT_DECAY = 1e-4
 CLIP_GRAD = 5.0
-TEACHER_FORCING_RATIO = 0.5
+MAX_TEACHER_FORCING_RATIO = 0.9   
+MIN_TEACHER_FORCING_RATIO = 0.1   
+TF_ANNEAL_EPOCHS = EPOCHS             
 SEED = 42
-
+NUM_WORKERS = 4
 # Image Parameters
 IMG_HEIGHT = 96
 IMG_WIDTH = 512 # Pad to a wide aspect ratio
@@ -82,6 +89,64 @@ def normalize_latex(formula):
     if not isinstance(formula, str):
         return ""
     return formula
+
+def load_data(csv_path, img_dir):
+    df = pd.read_csv(csv_path)
+    # Clean up image paths
+    # Drop rows with missing images
+    all_images = set(os.listdir(img_dir))
+    df = df[df['image'].isin(all_images)].reset_index(drop=True)
+    df['image'] = df['image'].apply(lambda x: os.path.join(img_dir, os.path.basename(x)))
+
+    # Normalize LaTeX (basic cleanup)
+    # df['formula'] = df['formula'].apply(lambda x: re.sub(r'\s+', ' ', x).strip())
+    print(f"{csv_path}: Loaded {len(df)} samples.")
+    return df
+
+def get_data_loaders(
+    train_pt, 
+    val_pt, 
+    test_pt, 
+    batch_size, 
+    num_workers, 
+    pad_idx
+):
+    
+    # Create datasets
+    train_dataset = PreprocessedIm2LatexDataset(train_pt)
+    val_dataset = PreprocessedIm2LatexDataset(val_pt)
+    test_dataset = PreprocessedIm2LatexDataset(test_pt)
+
+    # Create collate function
+    collate_fn = CollateFn(pad_idx)
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+
+    return train_loader, val_loader, test_loader
 
 class Tokenizer:
     """Builds a vocabulary and handles token-to-index mapping."""
@@ -159,10 +224,9 @@ image_transform = transforms.Compose([
     transforms.Normalize((0.5,), (0.5,)) # Normalize to [-1, 1]
 ])
 
-class LatexDataset(Dataset):
-    def __init__(self, df, img_dir, tokenizer, transform):
+class Im2LatexDataset(Dataset):
+    def __init__(self, df, tokenizer, transform):
         self.df = df
-        self.img_dir = img_dir
         self.tokenizer = tokenizer
         self.transform = transform
 
@@ -173,12 +237,12 @@ class LatexDataset(Dataset):
         row = self.df.iloc[idx]
         
         # Load and transform image
-        img_path = os.path.join(self.img_dir, row['image'])
+        img_path = row['image']
         try:
             image = Image.open(img_path).convert('L') # Convert to grayscale
         except FileNotFoundError:
-            print(f"Warning: Image not found {img_path}. Skipping.")
-            return self.__getitem__((idx + 1) % len(self))
+            print(f"Warning: Error loading image {img_path}. Using a blank image. Error: {e}")
+            image = torch.zeros((3, IMG_HEIGHT, IMG_WIDTH)) # 3 channels now
         
         image = self.transform(image)
         
@@ -204,6 +268,22 @@ class LatexDataset(Dataset):
             raise
 
         return image, torch.tensor(tokens).long()
+
+
+
+# It loads pre-processed tensors from a list
+class PreprocessedIm2LatexDataset(Dataset):
+    def __init__(self, pt_path):
+        print(f"Loading pre-processed data from {pt_path}...")
+        self.data = torch.load(pt_path)
+        print("Data loaded.")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        # Data is already a tuple of (image_tensor, formula_tensor)
+        return self.data[idx]
 
 class CollateFn:
     """Pads sequences in a batch to the same length."""
@@ -354,7 +434,7 @@ class AttentionDecoder(nn.Module):
 
 
 class LSTMDecoder(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, decoder_hidden_dim, encoder_dim):
+    def __init__(self, vocab_size, embedding_dim, decoder_hidden_dim, encoder_dim, dropout_p):
         """
         A standard LSTM decoder without attention.
         
@@ -363,6 +443,7 @@ class LSTMDecoder(nn.Module):
             embedding_dim: Dimension of token embeddings.
             decoder_hidden_dim: Dimension of the LSTM's hidden state.
             encoder_dim: Output dimension of the encoder (e.g., 2048 for ResNet-50).
+            dropout_p: Dropout probability for the embedding layer and fc output layer.
         """
         super(LSTMDecoder, self).__init__()
         self.vocab_size = vocab_size
@@ -371,6 +452,8 @@ class LSTMDecoder(nn.Module):
         
         # Embedding layer
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
+
+        self.embedding_dropout = nn.Dropout(dropout_p)
         
         # LSTMCell input is now *only* the embedding dimension
         self.lstm_cell = nn.LSTMCell(embedding_dim, decoder_hidden_dim)
@@ -383,6 +466,8 @@ class LSTMDecoder(nn.Module):
         
         # Final output layer to map hidden state to vocab
         self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
+
+        self.fc_dropout = nn.Dropout(dropout_p)
 
     def init_hidden_state(self, encoder_out):
         """
@@ -421,7 +506,7 @@ class LSTMDecoder(nn.Module):
         # Loop for each token in the sequence (t=1 is the first *prediction*)
         for t in range(1, max_seq_len):
             # Embed the input token
-            embedded = self.embedding(input_token) # (B, embedding_dim)
+            embedded = self.embedding_dropout(self.embedding(input_token)) # (B, embedding_dim)
 
             # The input to the LSTM is *only* the embedding
             
@@ -429,7 +514,7 @@ class LSTMDecoder(nn.Module):
             h, c = self.lstm_cell(embedded, (h, c))
             
             # Get the output prediction
-            output = self.fc_out(h) # (B, vocab_size)
+            output = self.fc_dropout(self.fc_out(h)) # (B, vocab_size)
             outputs[:, t, :] = output
             
             # Decide the next input token
@@ -448,6 +533,14 @@ class Im2LatexModel(nn.Module):
         super(Im2LatexModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+
+        checkpoint_path = "im2latex_best_model.pth"
+        if os.path.exists(checkpoint_path):
+            print(f"Loading checkpoint from {checkpoint_path}...")
+            self.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+            print("Checkpoint loaded successfully. Resuming training...")
+        else:
+            print("No checkpoint found. Starting training from scratch...")
     
     def forward(self, images, targets, teacher_forcing_ratio=0.5):
         encoder_out = self.encoder(images)
@@ -552,20 +645,20 @@ def evaluate(model, loader, criterion, tokenizer):
 def main():
     print("Loading and preprocessing data...")
     # Load CSV
-    try:
-        train_df = pd.read_csv(TRAIN_CSV_PATH)
-        val_df = pd.read_csv(VAL_CSV_PATH) 
-        test_df = pd.read_csv(TEST_CSV_PATH)
-    except FileNotFoundError:
-        print(f"Error: Could not find '{TRAIN_CSV_PATH}', '{VAL_CSV_PATH}', or '{TEST_CSV_PATH}'.")
-        print("Please download and unzip the 'im2latex100k' dataset first.")
-        return
+    # try:
+    #     train_df = pd.read_csv(TRAIN_CSV_PATH)
+    #     val_df = pd.read_csv(VAL_CSV_PATH) 
+    #     test_df = pd.read_csv(TEST_CSV_PATH)
+    # except FileNotFoundError:
+    #     print(f"Error: Could not find '{TRAIN_CSV_PATH}', '{VAL_CSV_PATH}', or '{TEST_CSV_PATH}'.")
+    #     print("Please download and unzip the 'im2latex100k' dataset first.")
+    #     return
 
     # Filter out missing images from the CSV
-    all_images = set(os.listdir(IMG_DIR))
-    print(f"Total images found: {len(all_images)}")
-    train_df = train_df[train_df['image'].isin(all_images)].reset_index(drop=True)
-    test_df = test_df[test_df['image'].isin(all_images)].reset_index(drop=True)
+    # all_images = set(os.listdir(IMG_DIR))
+    # print(f"Total images found: {len(all_images)}")
+    # train_df = train_df[train_df['image'].isin(all_images)].reset_index(drop=True)
+    # test_df = test_df[test_df['image'].isin(all_images)].reset_index(drop=True)
     
     # Create a smaller subset for faster prototyping (e.g., 20k)
     # df = df.sample(n=20000, random_state=SEED).reset_index(drop=True)
@@ -573,44 +666,95 @@ def main():
     
     # Build tokenizer
     print("Building tokenizer...")
+    train_df = load_data(TRAIN_CSV_PATH, IMG_DIR)
     corpus = [normalize_latex(f) for f in train_df['formula']]
-    print(len(corpus))
     tokenizer = Tokenizer(min_freq=5)
     tokenizer.fit(corpus)
     VOCAB_SIZE = tokenizer.vocab_size
+
+    for (name, csv_path, pt_path) in [
+        ("Training", TRAIN_CSV_PATH, TRAIN_PT_PATH),
+        ("Validation", VAL_CSV_PATH, VAL_PT_PATH),
+        ("Test", TEST_CSV_PATH, TEST_PT_PATH)
+    ]:
+        if not os.path.exists(pt_path):
+            print(f"Pre-processed {name} data not found at {pt_path}.")
+            print(f"Running one-time pre-processing for {name} data...")
+            
+            # Load the raw data paths/strings
+            df = load_data(csv_path, IMG_DIR)
+            print(f"{name} dataset size: {len(df)} samples.")
+            
+            # Use the on-the-fly dataset to do the processing
+            temp_dataset = Im2LatexDataset(df, tokenizer, image_transform)
+
+            temp_loader = DataLoader(
+                temp_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=False # Not sending to GPU
+            )
+            
+            processed_data = []
+            # This loop is now just appending, while the workers
+            # are doing the hard work in the background.
+            for batch in tqdm(temp_loader, desc=f"Processing {name} data"):
+                image_tensor, formula_tensor = batch
+                # Squeeze the batch_size=1 dimension
+                processed_data.append(
+                    (image_tensor.squeeze(0).clone(), formula_tensor.squeeze(0).clone())
+                )
+            
+            # Save the entire list of tensors
+            torch.save(processed_data, pt_path)
+            print(f"Saved pre-processed {name} data to {pt_path}.")
+        else:
+            print(f"Found pre-processed {name} data at {pt_path}.")
+
+    # 4. Get DataLoaders
+    # Now load directly from the pre-processed .pt files
+    train_loader, val_loader, test_loader = get_data_loaders(
+        TRAIN_PT_PATH,
+        VAL_PT_PATH,
+        TEST_PT_PATH,
+        BATCH_SIZE,
+        NUM_WORKERS,
+        PAD_TOKEN
+    )
     
     
-    # Create datasets
-    train_dataset = LatexDataset(train_df, IMG_DIR, tokenizer, image_transform)
-    val_dataset = LatexDataset(val_df, IMG_DIR, tokenizer, image_transform)
-    test_dataset = LatexDataset(test_df, IMG_DIR, tokenizer, image_transform)
+    # # Create datasets
+    # train_dataset = Im2LatexDataset(train_df, IMG_DIR, tokenizer, image_transform)
+    # val_dataset = Im2LatexDataset(val_df, IMG_DIR, tokenizer, image_transform)
+    # test_dataset = Im2LatexDataset(test_df, IMG_DIR, tokenizer, image_transform)
     
-    # Create dataloaders
-    collate_fn = CollateFn(pad_idx=PAD_TOKEN)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=4,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=4,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
+    # # Create dataloaders
+    # collate_fn = CollateFn(pad_idx=PAD_TOKEN)
+    # train_loader = DataLoader(
+    #     train_dataset,
+    #     batch_size=BATCH_SIZE,
+    #     shuffle=True,
+    #     num_workers=4,
+    #     collate_fn=collate_fn,
+    #     pin_memory=True
+    # )
+    # val_loader = DataLoader(
+    #     val_dataset,
+    #     batch_size=BATCH_SIZE,
+    #     shuffle=False,
+    #     num_workers=4,
+    #     collate_fn=collate_fn,
+    #     pin_memory=True
+    # )
+    # test_loader = DataLoader(
+    #     test_dataset,
+    #     batch_size=BATCH_SIZE,
+    #     shuffle=False,
+    #     num_workers=4,
+    #     collate_fn=collate_fn,
+    #     pin_memory=True
+    # )
     
     print("Initializing model...")
     # Initialize models
@@ -627,10 +771,13 @@ def main():
         vocab_size=VOCAB_SIZE,
         embedding_dim=EMBEDDING_DIM,
         decoder_hidden_dim=DECODER_HIDDEN_DIM,
-        encoder_dim=ENCODER_DIM
+        encoder_dim=ENCODER_DIM,
+        dropout_p=DROPOUT
     ).to(DEVICE)
     
     model = Im2LatexModel(encoder, decoder).to(DEVICE)
+
+
     
     # Optimizer and Loss
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -640,16 +787,23 @@ def main():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
         mode='max',  # Monitor BLEU score
-        factor=0.1,  
-        patience=5,  
+        factor=0.5,  
+        patience=3,  
     )
     
     print("Starting training...")
     best_bleu = 0.0
     epochs_no_improve = 0
-    patience = 10  # Stop after 10 epochs with no improvement
+    patience = 20  # Stop after 20 epochs with no improvement
     for epoch in range(1, EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{EPOCHS} ---")
+
+        tf_decay = (MAX_TEACHER_FORCING_RATIO - MIN_TEACHER_FORCING_RATIO) / TF_ANNEAL_EPOCHS
+        current_tf_ratio = max(
+            MIN_TEACHER_FORCING_RATIO,
+            MAX_TEACHER_FORCING_RATIO - (epoch - 1) * tf_decay
+        )
+        print(f"Using Teacher Forcing Ratio: {current_tf_ratio:.4f}")
         
         train_loss = train_one_epoch(
             model,
@@ -657,7 +811,7 @@ def main():
             optimizer,
             criterion,
             CLIP_GRAD,
-            TEACHER_FORCING_RATIO
+            current_tf_ratio
         )
         
         val_loss, val_bleu, val_em = evaluate(
