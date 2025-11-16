@@ -1,4 +1,5 @@
 # Install dependencies:
+# pip install torch torchvision pandas numpy pillow nltk tqdm scikit-learn
 import os
 import re
 import random
@@ -241,8 +242,8 @@ class Im2LatexDataset(Dataset):
         try:
             image = Image.open(img_path).convert('L') # Convert to grayscale
         except FileNotFoundError:
-            print(f"Warning: Error loading image {img_path}. Using a blank image. Error: {e}")
-            image = torch.zeros((3, IMG_HEIGHT, IMG_WIDTH)) # 3 channels now
+            print(f"Warning: Image not found {img_path}. Skipping.")
+            return self.__getitem__((idx + 1) % len(self))
         
         image = self.transform(image)
         
@@ -306,15 +307,66 @@ class CollateFn:
         
         return images, formulas
 
-# --- Model Architecture (CNN Encoder + Attention Decoder) ---
+# --- Model Architecture 
 
 class CNNEncoder(nn.Module):
+    """
+    CNN-based Encoder, without residual connections.
+    """
+    def __init__(self, encoded_image_size=16):
+        super(CNNEncoder, self).__init__()
+        self.encoded_image_size = encoded_image_size
+        
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1), # (B, 64, H, W)
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2), # (B, 64, H/2, W/2)
+
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1), # (B, 128, H/2, W/2)
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2), # (B, 128, H/4, W/4)
+
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1), # (B, 256, H/4, W/4)
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2), # (B, 256, H/8, W/8)
+
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1), # (B, 512, H/8, W/8)
+            nn.BatchNorm2d(512),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),  # (B, 512, H/16, W/16)
+
+            nn.Conv2d(512, ENCODER_DIM, kernel_size=3, stride=1, padding=1), # (B, encoder_dim, H/16, W/16)
+            nn.BatchNorm2d(ENCODER_DIM),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2)  # (B, encoder_dim, H/32, W/32)
+        )
+    
+    def __repr__(self):
+        return "CNNEncoder"
+    
+    def __str__(self):
+        return self.__repr__()
+    
+        
+    def forward(self, images):
+        out = self.conv_layers(images)
+
+        # Permute and flatten: (B, 2048, H_enc, W_enc) -> (B, H_enc*W_enc, 2048)
+        B, C, H_enc, W_enc = out.shape
+        out = out.permute(0, 2, 3, 1) # (B, H_enc, W_enc, C)
+        out = out.view(B, -1, C) # (B, num_pixels, encoder_dim)
+        return out
+
+class ResNetEncoder(nn.Module):
     """
     Encoder based on a pre-trained ResNet.
     Outputs a flattened sequence of features.
     """
     def __init__(self, encoded_image_size=16): # H/32 * W/32 = 3 * 16 = 48
-        super(CNNEncoder, self).__init__()
+        super(ResNetEncoder, self).__init__()
         resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
         # resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
         # Remove the final fully connected and avgpool layers
@@ -327,6 +379,12 @@ class CNNEncoder(nn.Module):
 
         # Adaptive pooling to get a fixed-size feature map
         self.adaptive_pool = nn.AdaptiveAvgPool2d((encoded_image_size, encoded_image_size))
+    
+    def __repr__(self):
+        return "ResNetEncoder"
+    
+    def __str__(self):
+        return self.__repr__()
 
     def forward(self, images):
         # images: (B, 1, H, W)
@@ -364,13 +422,14 @@ class Attention(nn.Module):
         return context, alpha
 
 class AttentionDecoder(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, decoder_hidden_dim, encoder_dim, attention_dim):
+    def __init__(self, vocab_size, embedding_dim, decoder_hidden_dim, encoder_dim, attention_dim, dropout_p):
         super(AttentionDecoder, self).__init__()
         self.vocab_size = vocab_size
         self.encoder_dim = encoder_dim
         self.decoder_hidden_dim = decoder_hidden_dim
         
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.embedding_dropout = nn.Dropout(dropout_p)
         self.attention = Attention(encoder_dim, decoder_hidden_dim, attention_dim)
         
         # LSTMCell input is embedding + context vector
@@ -383,6 +442,13 @@ class AttentionDecoder(nn.Module):
         
         # Final output layer
         self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
+        self.fc_dropout = nn.Dropout(dropout_p)
+    
+    def __repr__(self):
+        return f"AttentionDecoder"
+    
+    def __str__(self):
+        return self.__repr__()
 
     def init_hidden_state(self, encoder_out):
         """Initializes h and c states from the mean of encoder features."""
@@ -409,6 +475,7 @@ class AttentionDecoder(nn.Module):
         for t in range(1, max_seq_len):
             # Embed the input token
             embedded = self.embedding(input_token) # (B, embedding_dim)
+            embedded = self.embedding_dropout(embedded)
             
             # Get context vector from attention
             context, alpha = self.attention(encoder_out, h)
@@ -421,6 +488,7 @@ class AttentionDecoder(nn.Module):
             
             # Get prediction
             output = self.fc_out(h) # (B, vocab_size)
+            output = self.fc_dropout(output)
             outputs[:, t, :] = output
             
             # Decide next input token
@@ -468,6 +536,12 @@ class LSTMDecoder(nn.Module):
         self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
 
         self.fc_dropout = nn.Dropout(dropout_p)
+
+    def __repr__(self):
+        return f"LSTMDecoder"
+    
+    def __str__(self):
+        return self.__repr__()
 
     def init_hidden_state(self, encoder_out):
         """
@@ -534,7 +608,7 @@ class Im2LatexModel(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
 
-        checkpoint_path = "im2latex_best_model.pth"
+        checkpoint_path = f"im2latex_best_model_{encoder}_{decoder}.pth"
         if os.path.exists(checkpoint_path):
             print(f"Loading checkpoint from {checkpoint_path}...")
             self.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
@@ -642,7 +716,7 @@ def evaluate(model, loader, criterion, tokenizer):
 
 # --- Main Execution ---
 
-def main():
+def main(encoder_type, decoder_type):
     print("Loading and preprocessing data...")
     # Load CSV
     # try:
@@ -758,23 +832,31 @@ def main():
     
     print("Initializing model...")
     # Initialize models
-    encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
-    # decoder = AttentionDecoder(
-    #     vocab_size=VOCAB_SIZE,
-    #     embedding_dim=EMBEDDING_DIM,
-    #     decoder_hidden_dim=DECODER_HIDDEN_DIM,
-    #     encoder_dim=ENCODER_DIM,
-    #     attention_dim=ATTENTION_DIM
-    # ).to(DEVICE)
+    if encoder_type == "cnn_encoder":
+        encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
+    else:
+        raise ValueError("Unsupported encoder type")
 
-    decoder = LSTMDecoder(
-        vocab_size=VOCAB_SIZE,
-        embedding_dim=EMBEDDING_DIM,
-        decoder_hidden_dim=DECODER_HIDDEN_DIM,
-        encoder_dim=ENCODER_DIM,
-        dropout_p=DROPOUT
-    ).to(DEVICE)
-    
+    if decoder_type == "attention_decoder":
+        decoder = AttentionDecoder(
+            vocab_size=VOCAB_SIZE,
+            embedding_dim=EMBEDDING_DIM,
+            decoder_hidden_dim=DECODER_HIDDEN_DIM,
+            encoder_dim=ENCODER_DIM,
+            attention_dim=ATTENTION_DIM,
+            dropout_p=DROPOUT
+        ).to(DEVICE)
+    elif decoder_type == "lstm_decoder":
+        decoder = LSTMDecoder(
+            vocab_size=VOCAB_SIZE,
+            embedding_dim=EMBEDDING_DIM,
+            decoder_hidden_dim=DECODER_HIDDEN_DIM,
+            encoder_dim=ENCODER_DIM,
+            dropout_p=DROPOUT
+        ).to(DEVICE)
+    else:
+        raise ValueError("Unsupported decoder type")
+
     model = Im2LatexModel(encoder, decoder).to(DEVICE)
 
 
@@ -865,4 +947,6 @@ if __name__ == "__main__":
         print(f"Dataset not found in '{DATA_DIR}'.")
         print("Please follow the prerequisite steps to download and unzip the dataset.")
     else:
-        main()
+        encoder = "cnn_encoder"
+        decoder = "attention_decoder"
+        main(encoder, decoder)

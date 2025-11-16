@@ -4,3 +4,5 @@ __pycache__/
 .vscode/
 .DS_Store
 *.pdf
+im2latex100k/formula_images_processed/
+.DS_Store
