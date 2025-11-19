@@ -616,6 +616,12 @@ class Im2LatexModel(nn.Module):
         else:
             print("No checkpoint found. Starting training from scratch...")
     
+    def __repr__(self):
+        return f"{self.encoder}-{self.decoder}"
+
+    def __str__(self):
+        return self.__repr__()
+    
     def forward(self, images, targets, teacher_forcing_ratio=0.5):
         encoder_out = self.encoder(images)
         outputs = self.decoder(encoder_out, targets, teacher_forcing_ratio)
@@ -834,6 +840,8 @@ def main(encoder_type, decoder_type):
     # Initialize models
     if encoder_type == "cnn_encoder":
         encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
+    elif encoder_type == "resnet_encoder":
+        encoder = ResNetEncoder(encoded_image_size=16).to(DEVICE)
     else:
         raise ValueError("Unsupported encoder type")
 
@@ -858,6 +866,8 @@ def main(encoder_type, decoder_type):
         raise ValueError("Unsupported decoder type")
 
     model = Im2LatexModel(encoder, decoder).to(DEVICE)
+
+    print(f"Model initialized: {model}")
 
 
     
@@ -916,7 +926,7 @@ def main(encoder_type, decoder_type):
         if val_bleu > best_bleu:
             print(f"New best BLEU: {val_bleu:.4f}. Saving model...")
             best_bleu = val_bleu
-            torch.save(model.state_dict(), "im2latex_best_model.pth")
+            torch.save(model.state_dict(), f"im2latex_best_model_{model}.pth")
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
@@ -937,8 +947,8 @@ def main(encoder_type, decoder_type):
             break
 
         # Save a checkpoint
-        if epoch % 10 == 0:
-            torch.save(model.state_dict(), f"im2latex_baseline_epoch_{epoch}.pth")
+        # if epoch % 10 == 0:
+        #     torch.save(model.state_dict(), f"im2latex_baseline_epoch_{epoch}.pth")
 
     print("\nTraining complete.")
     
@@ -947,6 +957,7 @@ if __name__ == "__main__":
         print(f"Dataset not found in '{DATA_DIR}'.")
         print("Please follow the prerequisite steps to download and unzip the dataset.")
     else:
-        encoder = "cnn_encoder"
-        decoder = "attention_decoder"
-        main(encoder, decoder)
+        main("cnn_encoder", "lstm_decoder")
+        main("resnet_encoder", "lstm_decoder")
+        main("cnn_encoder", "attention_decoder")
+        main("resnet_encoder", "attention_decoder")
