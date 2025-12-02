@@ -1,5 +1,6 @@
 # Install dependencies:
 # pip install torch torchvision pandas numpy pillow nltk tqdm scikit-learn
+import json
 import os
 import re
 import random
@@ -20,6 +21,7 @@ from torchvision import models, transforms
 from nltk.translate.bleu_score import corpus_bleu
 
 import time
+from nltk.metrics.distance import edit_distance
 # --- Configuration ---
 
 # Set data paths
@@ -711,6 +713,19 @@ def evaluate(model, loader, criterion, tokenizer):
     # Calculate metrics
     val_loss = epoch_loss / len(loader)
     bleu_score = corpus_bleu(references, hypotheses)
+    # Calculate NED (Normalized Edit Distance)
+    ned_accum = 0
+    for i in range(len(hypotheses)):
+        hyp = hypotheses[i]
+        ref = references[i][0] # references is a list of lists (for corpus_bleu)
+        
+        if len(hyp) == 0 and len(ref) == 0:
+            ned_accum += 0
+        else:
+            # Token-level Levenshtein distance / max sequence length
+            ned_accum += edit_distance(hyp, ref) / max(len(hyp), len(ref))
+            
+    ned_score = ned_accum / len(hypotheses) if hypotheses else 0.0
     # Ensure bleu_score is a float
     if isinstance(bleu_score, (list, tuple)):
         bleu_score = float(bleu_score[0]) if bleu_score else 0.0
@@ -718,7 +733,7 @@ def evaluate(model, loader, criterion, tokenizer):
         bleu_score = float(bleu_score)
     exact_match = exact_match_count / len(loader.dataset)
     
-    return val_loss, bleu_score, exact_match
+    return val_loss, bleu_score, exact_match, ned_score
 
 # --- Main Execution ---
 
@@ -887,6 +902,9 @@ def main(encoder_type, decoder_type):
     best_bleu = 0.0
     epochs_no_improve = 0
     patience = 20  # Stop after 20 epochs with no improvement
+    train_record = {"loss": []}
+    val_record = {"loss": [], "bleu": [], "em": [], "ned": []}
+    test_record = {"loss": [], "bleu": [], "em": [], "ned": []}
     for epoch in range(1, EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{EPOCHS} ---")
 
@@ -905,13 +923,20 @@ def main(encoder_type, decoder_type):
             CLIP_GRAD,
             current_tf_ratio
         )
+
+        train_record["loss"].append(train_loss)
         
-        val_loss, val_bleu, val_em = evaluate(
+        val_loss, val_bleu, val_em, val_ned = evaluate(
             model,
             val_loader,
             criterion,
             tokenizer
         )
+
+        val_record["loss"].append(val_loss)
+        val_record["bleu"].append(val_bleu)
+        val_record["em"].append(val_em)
+        val_record["ned"].append(val_ned)
 
         scheduler.step(val_bleu)
         
@@ -922,6 +947,7 @@ def main(encoder_type, decoder_type):
         print(f"\tVal Loss:  {val_loss:.4f}")
         print(f"\tVal BLEU-4: {val_bleu:.4f}")
         print(f"\tVal Exact Match: {val_em:.4f}")
+        print(f"\tVal NED: {val_ned:.4f}")
 
         if val_bleu > best_bleu:
             print(f"New best BLEU: {val_bleu:.4f}. Saving model...")
@@ -934,7 +960,7 @@ def main(encoder_type, decoder_type):
 
         if epochs_no_improve >= patience:
             print(f"Stopping early after {patience} epochs with no improvement.")
-            test_loss, test_bleu, test_em = evaluate(
+            test_loss, test_bleu, test_em, test_ned = evaluate(
                 model,
                 test_loader,
                 criterion,
@@ -944,6 +970,11 @@ def main(encoder_type, decoder_type):
             print(f"Test Loss: {test_loss:.4f}")
             print(f"Test BLEU-4: {test_bleu:.4f}")
             print(f"Test Exact Match: {test_em:.4f}")
+            print(f"Test NED: {test_ned:.4f}")
+            test_record["loss"].append(test_loss)
+            test_record["bleu"].append(test_bleu)
+            test_record["em"].append(test_em)
+            test_record["ned"].append(test_ned)
             break
 
         # Save a checkpoint
@@ -951,6 +982,14 @@ def main(encoder_type, decoder_type):
         #     torch.save(model.state_dict(), f"im2latex_baseline_epoch_{epoch}.pth")
 
     print("\nTraining complete.")
+    # save training/validation/test records to a single json file
+    records = {
+        "train": train_record,
+        "val": val_record,
+        "test": test_record
+    }
+    with open(f"{model}_records.json", "w") as f:
+        json.dump(records, f, indent=4)
     
 if __name__ == "__main__":
     if not os.path.exists(IMG_DIR) or not os.path.exists(TRAIN_CSV_PATH) or not os.path.exists(VAL_CSV_PATH) or not os.path.exists(TEST_CSV_PATH):
