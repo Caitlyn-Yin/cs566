@@ -35,7 +35,7 @@ try:
         Im2LatexModel, ResizeAndPad, 
         Tokenizer, normalize_latex
     )
-    print("Successfully imported model classes from main.py")
+    # print("Successfully imported model classes from main.py")
 except ImportError:
     print("Could not import from main.py. Please ensure main.py is in the same directory.")
     exit(1)
@@ -247,6 +247,8 @@ def main():
         print("Processing image...")
         try:
             latex_output = predict(model, image_tensor, tokenizer)
+            # remove all spaces near []()\{\}^_
+            latex_output = re.sub(r'\s*([\[\]\(\)\{\}\^_])\s*', r'\1', latex_output)
             print("\nPredicted LaTeX:")
             print(f"{latex_output}")
         except Exception as e:

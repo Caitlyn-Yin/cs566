@@ -43,8 +43,8 @@ LEARNING_RATE = 1e-3
 DROPOUT = 0.3
 WEIGHT_DECAY = 1e-4
 CLIP_GRAD = 5.0
-MAX_TEACHER_FORCING_RATIO = 0.9   
-MIN_TEACHER_FORCING_RATIO = 0.1   
+MAX_TEACHER_FORCING_RATIO = 1.0 
+MIN_TEACHER_FORCING_RATIO = 0.5   
 TF_ANNEAL_EPOCHS = EPOCHS             
 SEED = 42
 NUM_WORKERS = 4
@@ -428,7 +428,7 @@ class ViTEncoder(nn.Module):
         
         x = x + self.vit.encoder.pos_embedding
         x = self.vit.encoder.layers(x)
-        x = x.vit.encoder.ln(x)
+        x = self.vit.encoder.ln(x)
         
         # Return sequence of patch embeddings (exclude class token)
         # Output shape: (B, num_patches, hidden_dim)
@@ -828,7 +828,7 @@ def main(encoder_type, decoder_type):
                 temp_dataset,
                 batch_size=1,
                 shuffle=False,
-                num_workers=4,
+                num_workers=NUM_WORKERS,
                 pin_memory=False # Not sending to GPU
             )
             
@@ -933,8 +933,6 @@ def main(encoder_type, decoder_type):
     model = Im2LatexModel(encoder, decoder).to(DEVICE)
 
     print(f"Model initialized: {model}")
-
-
     
     # Optimizer and Loss
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -950,8 +948,10 @@ def main(encoder_type, decoder_type):
     
     print("Starting training...")
     best_bleu = 0.0
+    best_em = 0.0
+    best_ned = float('inf')
     epochs_no_improve = 0
-    patience = 20  # Stop after 20 epochs with no improvement
+    patience = 10  # Stop after 10 epochs with no improvement
     train_record = {"loss": []}
     val_record = {"loss": [], "bleu": [], "em": [], "ned": []}
     test_record = {"loss": [], "bleu": [], "em": [], "ned": []}
@@ -988,7 +988,7 @@ def main(encoder_type, decoder_type):
         val_record["em"].append(val_em)
         val_record["ned"].append(val_ned)
 
-        scheduler.step(val_bleu)
+        scheduler.step(val_bleu + val_em - val_ned)  # Combine metrics for scheduling
         
         # print date and time
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -999,10 +999,13 @@ def main(encoder_type, decoder_type):
         print(f"\tVal Exact Match: {val_em:.4f}")
         print(f"\tVal NED: {val_ned:.4f}")
 
-        if val_bleu > best_bleu:
-            print(f"New best BLEU: {val_bleu:.4f}. Saving model...")
-            best_bleu = val_bleu
+        if val_bleu > best_bleu or val_em > best_em or val_ned < best_ned:
+            print(f"New best metric. Saving model...")
+            best_bleu = max(best_bleu, val_bleu)
+            best_em = max(best_em, val_em)
+            best_ned = min(best_ned, val_ned)
             torch.save(model.state_dict(), f"im2latex_best_model_{model}.pth")
+
             epochs_no_improve = 0
         else:
             epochs_no_improve += 1
