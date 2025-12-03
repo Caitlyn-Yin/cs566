@@ -399,6 +399,47 @@ class ResNetEncoder(nn.Module):
         out = out.view(B, -1, C) # (B, num_pixels, encoder_dim)
         return out
 
+class ViTEncoder(nn.Module):
+    """
+    Vision Transformer Encoder (ViT-B/16).
+    Resizes input to 224x224 and adapts 1-channel input to 3-channel.
+    """
+    def __init__(self):
+        super(ViTEncoder, self).__init__()
+        self.vit = models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1)
+        self.hidden_dim = 768
+        
+    def forward(self, images):
+        # images: (B, 1, H, W)
+        # Resize to 224x224 (standard ViT input size)
+        # Note: This changes aspect ratio, but is necessary for standard fixed pos embeddings
+        images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+        
+        # Repeat 1 channel to 3 channels
+        images = images.repeat(1, 3, 1, 1)
+        
+        # Use torchvision internal processing
+        x = self.vit._process_input(images)
+        n = x.shape[0]
+        
+        # Expand the class token to the full batch
+        batch_class_token = self.vit.class_token.expand(n, -1, -1)
+        x = torch.cat([batch_class_token, x], dim=1)
+        
+        x = x + self.vit.encoder.pos_embedding
+        x = self.vit.encoder.layers(x)
+        x = x.vit.encoder.ln(x)
+        
+        # Return sequence of patch embeddings (exclude class token)
+        # Output shape: (B, num_patches, hidden_dim)
+        return x[:, 1:]
+
+    def __repr__(self):
+        return "ViTEncoder"
+    
+    def __str__(self):
+        return self.__repr__()
+    
 class Attention(nn.Module):
     """Bahdanau-style (additive) Attention."""
     def __init__(self, encoder_dim, decoder_hidden_dim, attention_dim):
@@ -857,15 +898,24 @@ def main(encoder_type, decoder_type):
         encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
     elif encoder_type == "resnet_encoder":
         encoder = ResNetEncoder(encoded_image_size=16).to(DEVICE)
+    elif encoder_type == "vit_encoder":
+        encoder = ViTEncoder().to(DEVICE)
     else:
         raise ValueError("Unsupported encoder type")
+
+    # Determine encoder output dimension dynamically
+    with torch.no_grad():
+        dummy = torch.zeros(1, 1, IMG_HEIGHT, IMG_WIDTH).to(DEVICE)
+        enc_out = encoder(dummy)
+    detected_encoder_dim = enc_out.shape[2]
+    print(f"Detected encoder output dimension: {detected_encoder_dim}")
 
     if decoder_type == "attention_decoder":
         decoder = AttentionDecoder(
             vocab_size=VOCAB_SIZE,
             embedding_dim=EMBEDDING_DIM,
             decoder_hidden_dim=DECODER_HIDDEN_DIM,
-            encoder_dim=ENCODER_DIM,
+            encoder_dim=detected_encoder_dim,
             attention_dim=ATTENTION_DIM,
             dropout_p=DROPOUT
         ).to(DEVICE)
@@ -874,7 +924,7 @@ def main(encoder_type, decoder_type):
             vocab_size=VOCAB_SIZE,
             embedding_dim=EMBEDDING_DIM,
             decoder_hidden_dim=DECODER_HIDDEN_DIM,
-            encoder_dim=ENCODER_DIM,
+            encoder_dim=detected_encoder_dim,
             dropout_p=DROPOUT
         ).to(DEVICE)
     else:
@@ -1000,3 +1050,5 @@ if __name__ == "__main__":
         main("resnet_encoder", "lstm_decoder")
         main("cnn_encoder", "attention_decoder")
         main("resnet_encoder", "attention_decoder")
+        main("vit_encoder", "lstm_decoder")
+        main("vit_encoder", "attention_decoder")
