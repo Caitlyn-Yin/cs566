@@ -22,6 +22,14 @@ from nltk.translate.bleu_score import corpus_bleu
 
 import time
 from nltk.metrics.distance import edit_distance
+
+import getpass
+import socket
+
+username = getpass.getuser()
+hostname = socket.gethostname()
+
+print(f"{username}@{hostname}")
 # --- Configuration ---
 
 # Set data paths
@@ -39,12 +47,12 @@ TEST_PT_PATH = os.path.join(DATA_DIR, 'test_processed.pt')
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 256
 EPOCHS = 100
-LEARNING_RATE = 1e-3
+# LEARNING_RATE = 1e-3
 DROPOUT = 0.3
 WEIGHT_DECAY = 1e-4
 CLIP_GRAD = 5.0
-MAX_TEACHER_FORCING_RATIO = 1.0 
-MIN_TEACHER_FORCING_RATIO = 0.5   
+MAX_TEACHER_FORCING_RATIO = 1.0
+MIN_TEACHER_FORCING_RATIO = 0.3
 TF_ANNEAL_EPOCHS = EPOCHS             
 SEED = 42
 NUM_WORKERS = 4
@@ -77,20 +85,20 @@ print(f"Using device: {DEVICE}")
 # --- Data Preprocessing & Tokenizer ---
 
 def normalize_latex(formula):
-    # """
-    # Normalizes LaTeX strings to handle variations (your "side task").
-    # - Removes delimiters like $
-    # - Adds spaces around tokens
-    # - Collapses multiple spaces
-    # """
-    # formula = re.sub(r"(\$|\\\(|\\\))", "", formula) # Remove $ and \( \)
-    # formula = re.sub(r"\\( |mathrm|text|mathbf)\{.*?\}", "", formula) # Remove \text{} etc.
-    # formula = re.sub(r"([\{\}\(\)\[\]_\\^])", r" \1 ", formula) # Add space around brackets, etc.
-    # formula = re.sub(r"([+\-=<>,.!])", r" \1 ", formula) # Add space around operators
-    # formula = re.sub(r"\\([a-zA-Z]+)", r" \\\1 ", formula) # Add space around commands
-    # formula = re.sub(r"\s+", " ", formula).strip() # Collapse multiple spaces
     if not isinstance(formula, str):
         return ""
+    # replace two or more instances of "\," separated by some space  (example, \, \,  or \,  \, \,)with a space token <space>
+    formula = re.sub(r'(\\,(\s*\\,)+)', ' <space> ', formula)
+    # remove thin spaces \, and negative thin spaces \! only
+    formula = re.sub(r'(\\[,!])', '', formula)
+    # replace each instance of ~ \: \; \[space] \enspace \quad \qquad with a space token <space>
+    formula = re.sub(r'(~|\\:|\\;|\\ |\\enspace|\\quad|\\qquad)', ' <space> ', formula)
+    # replace \hspace { some text } \vspace { some text } with a space token <space>
+    formula = re.sub(r'(\\hspace\s*{[^}]*}|\\vspace\s*{[^}]*})', ' <space> ', formula)
+    # replace multiple instances of <space> separated by some space with a single <space>
+    formula = re.sub(r'(<space>\s*)+', ' <space> ', formula)
+    # replace multiple spaces with a single space
+    formula = re.sub(r'\s+', ' ', formula).strip()
     return formula
 
 def load_data(csv_path, img_dir):
@@ -169,6 +177,15 @@ class Tokenizer:
         
         self.idx2word = {v: k for k, v in self.word2idx.items()}
         print(f"Vocabulary built. Total size: {self.vocab_size}")
+
+    def save(self, path):
+        with open(path, 'w') as f:
+            json.dump(self.word2idx, f, indent=4)
+
+    def load(self, path):
+        with open(path, 'r') as f:
+            self.word2idx = json.load(f)
+        self.idx2word = {v: k for k, v in self.word2idx.items()}
 
     @property
     def vocab_size(self):
@@ -277,9 +294,8 @@ class Im2LatexDataset(Dataset):
 # It loads pre-processed tensors from a list
 class PreprocessedIm2LatexDataset(Dataset):
     def __init__(self, pt_path):
-        print(f"Loading pre-processed data from {pt_path}...")
         self.data = torch.load(pt_path)
-        print("Data loaded.")
+        print(f"Loaded pre-processed data from {pt_path}.")
 
     def __len__(self):
         return len(self.data)
@@ -411,8 +427,13 @@ class ViTEncoder(nn.Module):
         
     def forward(self, images):
         # images: (B, 1, H, W)
-        # Resize to 224x224 (standard ViT input size)
-        # Note: This changes aspect ratio, but is necessary for standard fixed pos embeddings
+        # Pad to square, then resize to 224x224
+        _, _, H, W = images.shape
+        if H != W:
+            size = max(H, W)
+            # center the image
+            padding = ((size - W) // 2, size - W - (size - W) // 2, (size - H) // 2, size - H - (size - H) // 2)
+            images = F.pad(images, padding, mode='constant', value=1) # Pad with white (1)
         images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
         
         # Repeat 1 channel to 3 channels
@@ -530,8 +551,8 @@ class AttentionDecoder(nn.Module):
             h, c = self.lstm_cell(lstm_input, (h, c))
             
             # Get prediction
-            output = self.fc_out(h) # (B, vocab_size)
-            output = self.fc_dropout(output)
+            h_drop = self.fc_dropout(h)
+            output = self.fc_out(h_drop) # (B, vocab_size)
             outputs[:, t, :] = output
             
             # Decide next input token
@@ -563,7 +584,6 @@ class LSTMDecoder(nn.Module):
         
         # Embedding layer
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
-
         self.embedding_dropout = nn.Dropout(dropout_p)
         
         # LSTMCell input is now *only* the embedding dimension
@@ -577,7 +597,6 @@ class LSTMDecoder(nn.Module):
         
         # Final output layer to map hidden state to vocab
         self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
-
         self.fc_dropout = nn.Dropout(dropout_p)
 
     def __repr__(self):
@@ -631,7 +650,8 @@ class LSTMDecoder(nn.Module):
             h, c = self.lstm_cell(embedded, (h, c))
             
             # Get the output prediction
-            output = self.fc_dropout(self.fc_out(h)) # (B, vocab_size)
+            h_drop = self.fc_dropout(h)
+            output = self.fc_out(h_drop) # (B, vocab_size)
             outputs[:, t, :] = output
             
             # Decide the next input token
@@ -646,18 +666,18 @@ class LSTMDecoder(nn.Module):
         return outputs
 
 class Im2LatexModel(nn.Module):
-    def __init__(self, encoder, decoder):
+    def __init__(self, encoder, decoder, resume=False):
         super(Im2LatexModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
+        # self.encoder_trainable = True
 
-        checkpoint_path = f"im2latex_best_model_{encoder}_{decoder}.pth"
-        if os.path.exists(checkpoint_path):
-            print(f"Loading checkpoint from {checkpoint_path}...")
+        checkpoint_path = f"im2latex_best_model_{self}_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth"
+        if resume and os.path.exists(checkpoint_path):
             self.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
-            print("Checkpoint loaded successfully. Resuming training...")
+            print(f"Checkpoint loaded from {checkpoint_path}.")
         else:
-            print("No checkpoint found. Starting training from scratch...")
+            print("Starting training from scratch...")
     
     def __repr__(self):
         return f"{self.encoder}-{self.decoder}"
@@ -670,10 +690,25 @@ class Im2LatexModel(nn.Module):
         outputs = self.decoder(encoder_out, targets, teacher_forcing_ratio)
         return outputs
 
+    # def set_encoder_trainable(self, trainable):
+    #     if self.encoder_trainable != trainable:
+    #         self.encoder_trainable = trainable
+    #         for param in self.encoder.parameters():
+    #             param.requires_grad = trainable
+
+    #     if trainable:
+    #         self.encoder.train()
+    #     else:
+    #         self.encoder.eval()
+        
+    #     print(f"Encoder trainable set to {trainable}.")
+
 # --- Training and Evaluation Loops ---
 
 def train_one_epoch(model, loader, optimizer, criterion, clip, teacher_forcing_ratio):
     model.train()
+    real_model = model.module if isinstance(model, nn.DataParallel) else model
+    # real_model.set_encoder_trainable(encoder_trainable)
     epoch_loss = 0
     
     # pbar = tqdm(loader, desc=f"Training Loss: {0:.4f}")
@@ -776,9 +811,147 @@ def evaluate(model, loader, criterion, tokenizer):
     
     return val_loss, bleu_score, exact_match, ned_score
 
-# --- Main Execution ---
+def test(encoder_type, decoder_type):
+    """
+    load the im2latex best model and evaluate on test set
+    """
+    print("Loading and preprocessing data for testing...")
+    
+    # Build tokenizer
+    print("Building tokenizer...")
+    VOCAB_PATH = os.path.join(DATA_DIR, 'vocab.json')
+    tokenizer = Tokenizer(min_freq=5)
 
-def main(encoder_type, decoder_type):
+    if os.path.exists(VOCAB_PATH):
+        print(f"Loading vocabulary from {VOCAB_PATH}...")
+        tokenizer.load(VOCAB_PATH)
+        print(f"Vocabulary loaded. Total size: {tokenizer.vocab_size}")
+    else:
+        print("Error: Vocabulary not found. Please run training first.")
+        return
+
+    VOCAB_SIZE = tokenizer.vocab_size
+
+    # Ensure test data is preprocessed
+    if not os.path.exists(TEST_PT_PATH):
+        print(f"Pre-processed Test data not found at {TEST_PT_PATH}.")
+        print("Running one-time pre-processing for Test data...")
+        df = load_data(TEST_CSV_PATH, IMG_DIR)
+        temp_dataset = Im2LatexDataset(df, tokenizer, image_transform)
+        temp_loader = DataLoader(temp_dataset, batch_size=1, shuffle=False, num_workers=NUM_WORKERS, pin_memory=False)
+        processed_data = []
+        for batch in tqdm(temp_loader, desc="Processing Test data"):
+            image_tensor, formula_tensor = batch
+            processed_data.append((image_tensor.squeeze(0).clone(), formula_tensor.squeeze(0).clone()))
+        torch.save(processed_data, TEST_PT_PATH)
+    
+    # Load Test DataLoader
+    test_dataset = PreprocessedIm2LatexDataset(TEST_PT_PATH)
+    collate_fn = CollateFn(PAD_TOKEN)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+
+    print("Initializing model...")
+    # Initialize models
+    if encoder_type == "cnn_encoder":
+        encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
+    elif encoder_type == "resnet_encoder":
+        encoder = ResNetEncoder(encoded_image_size=16).to(DEVICE)
+    elif encoder_type == "vit_encoder":
+        encoder = ViTEncoder().to(DEVICE)
+    else:
+        raise ValueError("Unsupported encoder type")
+
+    # Determine encoder output dimension dynamically
+    with torch.no_grad():
+        dummy = torch.zeros(1, 1, IMG_HEIGHT, IMG_WIDTH).to(DEVICE)
+        enc_out = encoder(dummy)
+    detected_encoder_dim = enc_out.shape[2]
+
+    if decoder_type == "attention_decoder":
+        decoder = AttentionDecoder(
+            vocab_size=VOCAB_SIZE,
+            embedding_dim=EMBEDDING_DIM,
+            decoder_hidden_dim=DECODER_HIDDEN_DIM,
+            encoder_dim=detected_encoder_dim,
+            attention_dim=ATTENTION_DIM,
+            dropout_p=DROPOUT
+        ).to(DEVICE)
+    elif decoder_type == "lstm_decoder":
+        decoder = LSTMDecoder(
+            vocab_size=VOCAB_SIZE,
+            embedding_dim=EMBEDDING_DIM,
+            decoder_hidden_dim=DECODER_HIDDEN_DIM,
+            encoder_dim=detected_encoder_dim,
+            dropout_p=DROPOUT
+        ).to(DEVICE)
+    else:
+        raise ValueError("Unsupported decoder type")
+
+    model = Im2LatexModel(encoder, decoder, resume=False).to(DEVICE)
+    
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
+    # Load best model weights
+    checkpoint_path = f"im2latex_best_model_{model.module if isinstance(model, nn.DataParallel) else model}_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth"
+    if os.path.exists(checkpoint_path):
+        model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
+        print(f"Loaded best model from {checkpoint_path}")
+    else:
+        print(f"Error: Checkpoint {checkpoint_path} not found.")
+        return
+
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
+
+    print("Starting evaluation on test set...")
+    test_loss, test_bleu, test_em, test_ned = evaluate(
+        model,
+        test_loader,
+        criterion,
+        tokenizer
+    )
+    
+    print(f"\n--- Test Set Evaluation ---")
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test BLEU-4: {test_bleu:.4f}")
+    print(f"Test Exact Match: {test_em:.4f}")
+    print(f"Test NED: {test_ned:.4f}")
+
+    results = {
+        "test_loss": test_loss,
+        "test_bleu": test_bleu,
+        "test_em": test_em,
+        "test_ned": test_ned
+    }
+    
+    output_file = f"test_results_{model.module if isinstance(model, nn.DataParallel) else model}.json"
+    with open(output_file, "w") as f:
+        json.dump(results, f, indent=4)
+    print(f"Results saved to {output_file}")
+
+def get_teacher_forcing_ratio(epoch, max_tfr, min_tfr, total_epochs):
+    """Linearly decays teacher forcing ratio from max_tfr to min_tfr over total_epochs."""
+    # Warmup for first 5% of epochs
+    if epoch < int(0.05 * total_epochs):
+        return max_tfr
+    
+    # Linear decay until 80% of epochs
+    if epoch < int(0.8 * total_epochs):
+        # Decaying from 1.0 to 0.3 over 70 epochs
+        decay_rate = (max_tfr - min_tfr) / (int(0.8 * total_epochs) - int(0.05 * total_epochs))
+        return max_tfr - (decay_rate * (epoch - int(0.05 * total_epochs)))
+        
+    # Floor at 0.3 for the rest
+    return min_tfr
+
+def main(encoder_type, decoder_type, resume=False):
     print("Loading and preprocessing data...")
     # Load CSV
     # try:
@@ -802,10 +975,20 @@ def main(encoder_type, decoder_type):
     
     # Build tokenizer
     print("Building tokenizer...")
-    train_df = load_data(TRAIN_CSV_PATH, IMG_DIR)
-    corpus = [normalize_latex(f) for f in train_df['formula']]
+    VOCAB_PATH = os.path.join(DATA_DIR, 'vocab.json')
     tokenizer = Tokenizer(min_freq=5)
-    tokenizer.fit(corpus)
+
+    if os.path.exists(VOCAB_PATH):
+        print(f"Loading vocabulary from {VOCAB_PATH}...")
+        tokenizer.load(VOCAB_PATH)
+        print(f"Vocabulary loaded. Total size: {tokenizer.vocab_size}")
+    else:
+        train_df = load_data(TRAIN_CSV_PATH, IMG_DIR)
+        corpus = [normalize_latex(f) for f in train_df['formula']]
+        tokenizer.fit(corpus)
+        print(f"Saving vocabulary to {VOCAB_PATH}...")
+        tokenizer.save(VOCAB_PATH)
+
     VOCAB_SIZE = tokenizer.vocab_size
 
     for (name, csv_path, pt_path) in [
@@ -859,47 +1042,17 @@ def main(encoder_type, decoder_type):
         PAD_TOKEN
     )
     
-    
-    # # Create datasets
-    # train_dataset = Im2LatexDataset(train_df, IMG_DIR, tokenizer, image_transform)
-    # val_dataset = Im2LatexDataset(val_df, IMG_DIR, tokenizer, image_transform)
-    # test_dataset = Im2LatexDataset(test_df, IMG_DIR, tokenizer, image_transform)
-    
-    # # Create dataloaders
-    # collate_fn = CollateFn(pad_idx=PAD_TOKEN)
-    # train_loader = DataLoader(
-    #     train_dataset,
-    #     batch_size=BATCH_SIZE,
-    #     shuffle=True,
-    #     num_workers=4,
-    #     collate_fn=collate_fn,
-    #     pin_memory=True
-    # )
-    # val_loader = DataLoader(
-    #     val_dataset,
-    #     batch_size=BATCH_SIZE,
-    #     shuffle=False,
-    #     num_workers=4,
-    #     collate_fn=collate_fn,
-    #     pin_memory=True
-    # )
-    # test_loader = DataLoader(
-    #     test_dataset,
-    #     batch_size=BATCH_SIZE,
-    #     shuffle=False,
-    #     num_workers=4,
-    #     collate_fn=collate_fn,
-    #     pin_memory=True
-    # )
-    
     print("Initializing model...")
     # Initialize models
     if encoder_type == "cnn_encoder":
         encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
+        encoder_lr = 1e-3
     elif encoder_type == "resnet_encoder":
         encoder = ResNetEncoder(encoded_image_size=16).to(DEVICE)
+        encoder_lr = 2e-5
     elif encoder_type == "vit_encoder":
         encoder = ViTEncoder().to(DEVICE)
+        encoder_lr = 2e-5
     else:
         raise ValueError("Unsupported encoder type")
 
@@ -919,6 +1072,7 @@ def main(encoder_type, decoder_type):
             attention_dim=ATTENTION_DIM,
             dropout_p=DROPOUT
         ).to(DEVICE)
+        decoder_lr=1e-3
     elif decoder_type == "lstm_decoder":
         decoder = LSTMDecoder(
             vocab_size=VOCAB_SIZE,
@@ -927,23 +1081,36 @@ def main(encoder_type, decoder_type):
             encoder_dim=detected_encoder_dim,
             dropout_p=DROPOUT
         ).to(DEVICE)
+        decoder_lr=1e-3
     else:
         raise ValueError("Unsupported decoder type")
 
-    model = Im2LatexModel(encoder, decoder).to(DEVICE)
+    model = Im2LatexModel(encoder, decoder, resume).to(DEVICE)
 
-    print(f"Model initialized: {model}")
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
+
+    print(f"Model initialized: {model.module if isinstance(model, nn.DataParallel) else model}")
     
     # Optimizer and Loss
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    optimizer_grouped_parameters = [
+        {'params': encoder.parameters(), 'lr': encoder_lr},
+        {'params': decoder.parameters(), 'lr': decoder_lr}
+    ]
+    
+    optimizer = optim.Adam(optimizer_grouped_parameters, weight_decay=WEIGHT_DECAY)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
 
     # Add a scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, 
-        mode='max',  # Monitor BLEU score
+        # mode='max',  # Monitor val BLEU + EM - NED
+        mode='min', # Monitor val loss
         factor=0.5,  
-        patience=3,  
+        patience=4,
+        cooldown=2,
+        min_lr=[5e-6, 5e-5]
     )
     
     print("Starting training...")
@@ -959,11 +1126,21 @@ def main(encoder_type, decoder_type):
         print(f"\n--- Epoch {epoch}/{EPOCHS} ---")
 
         tf_decay = (MAX_TEACHER_FORCING_RATIO - MIN_TEACHER_FORCING_RATIO) / TF_ANNEAL_EPOCHS
-        current_tf_ratio = max(
+        current_tf_ratio = get_teacher_forcing_ratio(
+            epoch,
+            MAX_TEACHER_FORCING_RATIO,
             MIN_TEACHER_FORCING_RATIO,
-            MAX_TEACHER_FORCING_RATIO - (epoch - 1) * tf_decay
+            TF_ANNEAL_EPOCHS
         )
         print(f"Using Teacher Forcing Ratio: {current_tf_ratio:.4f}")
+
+        # if encoder_type in ["resnet_encoder", "vit_encoder"]:
+        #     # Freeze encoder for first few epochs
+        #     encoder_trainable = epoch > 5
+        #     if not encoder_trainable:
+        #         print("Freezing encoder parameters for this epoch.")
+        # else:
+        #     encoder_trainable = True
         
         train_loss = train_one_epoch(
             model,
@@ -972,6 +1149,7 @@ def main(encoder_type, decoder_type):
             criterion,
             CLIP_GRAD,
             current_tf_ratio
+            # encoder_trainable
         )
 
         train_record["loss"].append(train_loss)
@@ -988,7 +1166,9 @@ def main(encoder_type, decoder_type):
         val_record["em"].append(val_em)
         val_record["ned"].append(val_ned)
 
-        scheduler.step(val_bleu + val_em - val_ned)  # Combine metrics for scheduling
+        # scheduler.step(val_bleu + val_em - val_ned)  # Combine metrics for scheduling
+        if epoch > 5:
+            scheduler.step(val_loss)  # Use validation loss for scheduling
         
         # print date and time
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -1004,7 +1184,9 @@ def main(encoder_type, decoder_type):
             best_bleu = max(best_bleu, val_bleu)
             best_em = max(best_em, val_em)
             best_ned = min(best_ned, val_ned)
-            torch.save(model.state_dict(), f"im2latex_best_model_{model}.pth")
+            
+            model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+            torch.save(model_to_save.state_dict(), f"im2latex_best_model_{model_to_save}_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth")
 
             epochs_no_improve = 0
         else:
@@ -1013,22 +1195,27 @@ def main(encoder_type, decoder_type):
 
         if epochs_no_improve >= patience:
             print(f"Stopping early after {patience} epochs with no improvement.")
-            test_loss, test_bleu, test_em, test_ned = evaluate(
-                model,
-                test_loader,
-                criterion,
-                tokenizer
-            )
-            print(f"\n--- Test Set Evaluation ---")
-            print(f"Test Loss: {test_loss:.4f}")
-            print(f"Test BLEU-4: {test_bleu:.4f}")
-            print(f"Test Exact Match: {test_em:.4f}")
-            print(f"Test NED: {test_ned:.4f}")
-            test_record["loss"].append(test_loss)
-            test_record["bleu"].append(test_bleu)
-            test_record["em"].append(test_em)
-            test_record["ned"].append(test_ned)
             break
+    
+    # load the best model for final evaluation
+    print("Loading best model for final evaluation on test set...")
+    model_to_load = model.module if isinstance(model, nn.DataParallel) else model
+    model_to_load.load_state_dict(torch.load(f"im2latex_best_model_{model_to_load}_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth", map_location=DEVICE))
+    test_loss, test_bleu, test_em, test_ned = evaluate(
+        model,
+        test_loader,
+        criterion,
+        tokenizer
+    )
+    print(f"\n--- Test Set Evaluation ---")
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test BLEU-4: {test_bleu:.4f}")
+    print(f"Test Exact Match: {test_em:.4f}")
+    print(f"Test NED: {test_ned:.4f}")
+    test_record["loss"].append(test_loss)
+    test_record["bleu"].append(test_bleu)
+    test_record["em"].append(test_em)
+    test_record["ned"].append(test_ned)
 
         # Save a checkpoint
         # if epoch % 10 == 0:
@@ -1041,7 +1228,7 @@ def main(encoder_type, decoder_type):
         "val": val_record,
         "test": test_record
     }
-    with open(f"{model}_records.json", "w") as f:
+    with open(f"{model}_records_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.json", "w") as f:
         json.dump(records, f, indent=4)
     
 if __name__ == "__main__":
@@ -1049,9 +1236,9 @@ if __name__ == "__main__":
         print(f"Dataset not found in '{DATA_DIR}'.")
         print("Please follow the prerequisite steps to download and unzip the dataset.")
     else:
-        main("cnn_encoder", "lstm_decoder")
-        main("resnet_encoder", "lstm_decoder")
-        main("cnn_encoder", "attention_decoder")
-        main("resnet_encoder", "attention_decoder")
-        main("vit_encoder", "lstm_decoder")
+        # main("resnet_encoder", "lstm_decoder")
+        # main("cnn_encoder", "lstm_decoder")
+        # main("resnet_encoder", "attention_decoder")
+        # main("cnn_encoder", "attention_decoder")
+        # main("vit_encoder", "lstm_decoder")
         main("vit_encoder", "attention_decoder")

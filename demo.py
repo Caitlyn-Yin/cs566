@@ -92,20 +92,25 @@ def load_model(model_path):
     # For now, let's try to load the training data to build the tokenizer just like main.py
     # This is slow but ensures correctness.
     
-    print("Rebuilding tokenizer to ensure correct vocabulary...")
-    # Hardcoded path from main.py context
+    # Load tokenizer
     TRAIN_CSV_PATH = './im2latex100k/im2latex_train.csv'
-    if os.path.exists(TRAIN_CSV_PATH):
+    VOCAB_PATH = './im2latex100k/vocab.json'
+    tokenizer = Tokenizer(min_freq=5)
+
+    if os.path.exists(VOCAB_PATH):
+        print(f"Loading vocabulary from {VOCAB_PATH}...")
+        tokenizer.load(VOCAB_PATH)
+        vocab_size = tokenizer.vocab_size
+    elif os.path.exists(TRAIN_CSV_PATH):
+        print("Rebuilding tokenizer from CSV (vocab.json not found)...")
         import pandas as pd
         df = pd.read_csv(TRAIN_CSV_PATH)
         corpus = [normalize_latex(f) for f in df['formula']]
-        tokenizer = Tokenizer(min_freq=5)
         tokenizer.fit(corpus)
         vocab_size = tokenizer.vocab_size
     else:
-        print("Warning: Training CSV not found. Using default vocab size (which might be wrong).")
+        print("Warning: Training CSV and vocab.json not found. Using default vocab size (which might be wrong).")
         vocab_size = 8000 # Fallback
-        tokenizer = Tokenizer(min_freq=5) # Empty tokenizer
     
     if "attention" in model_path.lower():
         decoder = AttentionDecoder(
@@ -220,7 +225,7 @@ def main():
     print("--- Im2Latex Demo ---")
     
     # 1. Load Model
-    model_path = input("Enter path to model checkpoint (leave empty for default): ").strip()
+    model_path = input("Enter path to model checkpoint (leave empty for default): ").strip(' "\'')
     model, tokenizer = load_model(model_path)
     
     if model is None:
@@ -249,6 +254,9 @@ def main():
             latex_output = predict(model, image_tensor, tokenizer)
             # remove all spaces near []()\{\}^_
             latex_output = re.sub(r'\s*([\[\]\(\)\{\}\^_])\s*', r'\1', latex_output)
+            # remove <space> token
+            latex_output = latex_output.replace("<space>", " ")
+            latex_output = re.sub(r'\s+', ' ', latex_output).strip()
             print("\nPredicted LaTeX:")
             print(f"{latex_output}")
         except Exception as e:
