@@ -34,14 +34,15 @@ print(f"{username}@{hostname}")
 
 # Set data paths
 DATA_DIR = './im2latex100k' # Directory where you unzipped the dataset
+VOCAB_CSV_PATH = os.path.join(DATA_DIR, 'im2latex_formulas.csv')
 TRAIN_CSV_PATH = os.path.join(DATA_DIR, 'im2latex_train.csv')
 VAL_CSV_PATH = os.path.join(DATA_DIR, 'im2latex_validate.csv')
 TEST_CSV_PATH = os.path.join(DATA_DIR, 'im2latex_test.csv')
 IMG_DIR = os.path.join(DATA_DIR, 'formula_images_processed')
 
-TRAIN_PT_PATH = os.path.join(DATA_DIR, 'train_processed.pt')
-VAL_PT_PATH = os.path.join(DATA_DIR, 'val_processed.pt')
-TEST_PT_PATH = os.path.join(DATA_DIR, 'test_processed.pt')
+TRAIN_PT_PATH = os.path.join(DATA_DIR, 'train_processed_space_token.pt')
+VAL_PT_PATH = os.path.join(DATA_DIR, 'val_processed_space_token.pt')
+TEST_PT_PATH = os.path.join(DATA_DIR, 'test_processed_space_token.pt')
 
 # Model & Training Hyperparameters
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -127,6 +128,11 @@ def get_data_loaders(
     train_dataset = PreprocessedIm2LatexDataset(train_pt)
     val_dataset = PreprocessedIm2LatexDataset(val_pt)
     test_dataset = PreprocessedIm2LatexDataset(test_pt)
+
+    # # sample 25% of the training data for faster debugging. train_dataset.data is a list
+    # subset_size = len(train_dataset) // 5
+    
+    # train_dataset.data = train_dataset.data[:subset_size]
 
     # Create collate function
     collate_fn = CollateFn(pad_idx)
@@ -852,7 +858,7 @@ def test(encoder_type, decoder_type):
         test_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=NUM_WORKERS,
+        num_workers=8,
         pin_memory=True,
         collate_fn=collate_fn
     )
@@ -983,8 +989,8 @@ def main(encoder_type, decoder_type, resume=False):
         tokenizer.load(VOCAB_PATH)
         print(f"Vocabulary loaded. Total size: {tokenizer.vocab_size}")
     else:
-        train_df = load_data(TRAIN_CSV_PATH, IMG_DIR)
-        corpus = [normalize_latex(f) for f in train_df['formula']]
+        vocab_df = pd.read_csv(VOCAB_CSV_PATH)
+        corpus = [normalize_latex(f) for f in tqdm(vocab_df['formulas'])]
         tokenizer.fit(corpus)
         print(f"Saving vocabulary to {VOCAB_PATH}...")
         tokenizer.save(VOCAB_PATH)
@@ -1049,10 +1055,10 @@ def main(encoder_type, decoder_type, resume=False):
         encoder_lr = 1e-3
     elif encoder_type == "resnet_encoder":
         encoder = ResNetEncoder(encoded_image_size=16).to(DEVICE)
-        encoder_lr = 2e-5
+        encoder_lr = 1e-3
     elif encoder_type == "vit_encoder":
         encoder = ViTEncoder().to(DEVICE)
-        encoder_lr = 2e-5
+        encoder_lr = 1e-4
     else:
         raise ValueError("Unsupported encoder type")
 
@@ -1236,9 +1242,9 @@ if __name__ == "__main__":
         print(f"Dataset not found in '{DATA_DIR}'.")
         print("Please follow the prerequisite steps to download and unzip the dataset.")
     else:
+        # main("resnet_encoder", "attention_decoder")
         # main("resnet_encoder", "lstm_decoder")
         # main("cnn_encoder", "lstm_decoder")
-        # main("resnet_encoder", "attention_decoder")
         # main("cnn_encoder", "attention_decoder")
-        # main("vit_encoder", "lstm_decoder")
         main("vit_encoder", "attention_decoder")
+        main("vit_encoder", "lstm_decoder")
