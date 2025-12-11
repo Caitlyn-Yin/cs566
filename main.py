@@ -5,6 +5,7 @@ import os
 import re
 import random
 from collections import Counter
+import math
 
 import numpy as np
 import pandas as pd
@@ -40,26 +41,26 @@ VAL_CSV_PATH = os.path.join(DATA_DIR, 'im2latex_validate.csv')
 TEST_CSV_PATH = os.path.join(DATA_DIR, 'im2latex_test.csv')
 IMG_DIR = os.path.join(DATA_DIR, 'formula_images_processed')
 
-TRAIN_PT_PATH = os.path.join(DATA_DIR, 'train_processed_space_token.pt')
-VAL_PT_PATH = os.path.join(DATA_DIR, 'val_processed_space_token.pt')
-TEST_PT_PATH = os.path.join(DATA_DIR, 'test_processed_space_token.pt')
+TRAIN_PT_PATH = os.path.join(DATA_DIR, 'train_processed.pt')
+VAL_PT_PATH = os.path.join(DATA_DIR, 'val_processed.pt')
+TEST_PT_PATH = os.path.join(DATA_DIR, 'test_processed.pt')
 
 # Model & Training Hyperparameters
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-BATCH_SIZE = 256
+# BATCH_SIZE = 256
+BATCH_SIZE = 512
 EPOCHS = 100
 # LEARNING_RATE = 1e-3
 DROPOUT = 0.3
-WEIGHT_DECAY = 1e-4
 CLIP_GRAD = 5.0
-MAX_TEACHER_FORCING_RATIO = 1.0
-MIN_TEACHER_FORCING_RATIO = 0.3
+LABEL_SMOOTHING = 0.1
+
+MAX_SEQ_LEN = 180
+
 TF_ANNEAL_EPOCHS = EPOCHS             
 SEED = 42
 NUM_WORKERS = 4
 # Image Parameters
-IMG_HEIGHT = 96
-IMG_WIDTH = 512 # Pad to a wide aspect ratio
 
 # Model Dimensions
 EMBEDDING_DIM = 256
@@ -85,7 +86,7 @@ print(f"Using device: {DEVICE}")
 
 # --- Data Preprocessing & Tokenizer ---
 
-def normalize_latex(formula):
+def normalize_latex_old(formula):
     if not isinstance(formula, str):
         return ""
     # replace two or more instances of "\," separated by some space  (example, \, \,  or \,  \, \,)with a space token <space>
@@ -100,6 +101,58 @@ def normalize_latex(formula):
     formula = re.sub(r'(<space>\s*)+', ' <space> ', formula)
     # replace multiple spaces with a single space
     formula = re.sub(r'\s+', ' ', formula).strip()
+    assert "vspace" not in formula, "vspace found in formula after normalization"
+    return formula
+
+
+def normalize_latex(formula):
+    if not isinstance(formula, str):
+        return ""
+    # replace two or more instances of "\," separated by some space  (example, \, \,  or \,  \, \,)with a space token <space>
+    formula = re.sub(r'(\\,(\s*\\,)+)', ' <space> ', formula)
+    # remove thin spaces \, and negative thin spaces \! only
+    formula = re.sub(r'(\\[,!])', '', formula)
+    # replace each instance of ~ \: \; \[space] \enspace \quad \qquad with a space token <space>
+    formula = re.sub(r'(~|\\:|\\;|\\ |\\enspace|\\quad|\\qquad)', ' <space> ', formula)
+    # replace \hspace { some text } \vspace { some text } with a space token <space>
+    formula = re.sub(r'(\\hspace\s*{[^}]*}|\\vspace\s*{[^}]*})', ' <space> ', formula)
+    # replace multiple instances of <space> separated by some space with a single <space>
+    formula = re.sub(r'(<space>\s*)+', ' <space> ', formula)
+    # replace \left< and right> with \langle and \rangle
+    formula = re.sub(r'\\left<', r'\\langle', formula)
+    formula = re.sub(r'\\right>', r'\\rangle', formula)
+    # replace \prime with ', \lbrack with [, \rbrack with ], \lbrace with {, \rbrace with }, \vert with |
+    formula = re.sub(r'\\prime', r"'", formula)
+    formula = re.sub(r'\\lbrack', r'[', formula)
+    formula = re.sub(r'\\rbrack', r']', formula)
+    formula = re.sub(r'\\lbrace', r'{', formula)
+    formula = re.sub(r'\\rbrace', r'}', formula)
+    formula = re.sub(r'\\vert', r'|', formula)
+    # replace \left. and \right. with nothing
+    formula = re.sub(r'\\left\.|\\right\.', '', formula)
+    # replace \left and \right with nothing
+    formula = re.sub(r'\\left|\\right', '', formula)
+    # replace \[bB]ig[g][lr] to nothing
+    formula = re.sub(r'\\[bB]igg?[lr]?(?![a-zA-Z])', '', formula)
+    # replace \to with \rightarrow
+    formula = re.sub(r'\\to', r'\\rightarrow', formula)
+    # replace \ne, \le, \ge with \neq, \leq, \geq
+    formula = re.sub(r'\\ne', r'\\neq', formula)
+    formula = re.sub(r'\\le', r'\\leq', formula)
+    formula = re.sub(r'\\ge', r'\\geq', formula)
+    # replace \slash with /
+    formula = re.sub(r'\\slash', r'/', formula)
+    # replace \mathbf and \textbf with \bf;same for \it, \sf, \tt, \rm
+    formula = re.sub(r'\\mathbf|\\textbf', r'\\bf', formula)
+    formula = re.sub(r'\\mathit|\\textit', r'\\it', formula)
+    formula = re.sub(r'\\mathsf|\\textsf', r'\\sf', formula)
+    formula = re.sub(r'\\mathtt|\\texttt', r'\\tt', formula)
+    formula = re.sub(r'\\mathrm|\\textrm', r'\\mathrm', formula) # \rm not in vocab
+    # replace \triangle with \bigtriangleup
+    formula = re.sub(r'\\triangle(?![a-zA-Z])', r'\\bigtriangleup', formula)
+    # replace multiple spaces with a single space
+    formula = re.sub(r'\s+', ' ', formula).strip()
+    assert "vspace" not in formula, "vspace found in formula after normalization"
     return formula
 
 def load_data(csv_path, img_dir):
@@ -129,6 +182,21 @@ def get_data_loaders(
     val_dataset = PreprocessedIm2LatexDataset(val_pt)
     test_dataset = PreprocessedIm2LatexDataset(test_pt)
 
+    # Calculate sequence length statistics
+    # for data, name in [(train_dataset.data, "Training"), (val_dataset.data, "Validation"), (test_dataset.data, "Test")]:
+    #     seq_lengths = [len(item[1]) for item in data]
+    #     seq_lengths.sort()
+    #     total_samples = len(seq_lengths)
+        
+    #     print(f"\n--- Sequence Length Statistics ({name} Set) ---")
+    #     percentiles = [0.50, 0.75, 0.90, 0.95, 0.97, 0.98, 0.99, 0.999, 0.9999, 1.0]
+    #     for p in percentiles:
+    #         idx = int(p * total_samples) - 1
+    #         val = seq_lengths[idx]
+    #         print(f"{p*100}% percentile: {val}")
+    #     print("---------------------------------------------\n")
+    
+
     # # sample 25% of the training data for faster debugging. train_dataset.data is a list
     # subset_size = len(train_dataset) // 5
     
@@ -148,7 +216,7 @@ def get_data_loaders(
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=batch_size*2,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
@@ -156,13 +224,14 @@ def get_data_loaders(
     )
     test_loader = DataLoader(
         test_dataset,
-        batch_size=batch_size,
+        batch_size=batch_size*2,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=collate_fn
     )
 
+    # return None, None, test_loader
     return train_loader, val_loader, test_loader
 
 class Tokenizer:
@@ -200,6 +269,9 @@ class Tokenizer:
     def transform(self, formula_str):
         """Converts a string to a list of indices, including <sos> and <eos>."""
         tokens = formula_str.split()
+        # max_tokens = MAX_SEQ_LEN - 2  # Reserve space for <sos> and <eos>
+        # if len(tokens) > max_tokens:
+        #     tokens = tokens[:max_tokens]
         indices = [self.word2idx.get(token, UNK_TOKEN) for token in tokens]
         return [SOS_TOKEN] + indices + [EOS_TOKEN]
 
@@ -218,7 +290,7 @@ class Tokenizer:
 class ResizeAndPad:
     """
     Resizes an image to fit within (H, W) while maintaining aspect ratio,
-    then pads the rest with black.
+    then pads the rest with white.
     """
     def __init__(self, output_size):
         self.output_height, self.output_width = output_size
@@ -236,19 +308,14 @@ class ResizeAndPad:
             resample = Image.LANCZOS
         img = img.resize((new_w, new_h), resample)
         
-        # Create a black canvas and paste the resized image
-        new_img = Image.new("L", (self.output_width, self.output_height), 0)
+        # Create a white canvas and paste the resized image
+        new_img = Image.new("L", (self.output_width, self.output_height), 255)
         paste_x = (self.output_width - new_w) // 2
         paste_y = (self.output_height - new_h) // 2
         new_img.paste(img, (paste_x, paste_y))
         return new_img
 
-# Define image transformations
-image_transform = transforms.Compose([
-    ResizeAndPad((IMG_HEIGHT, IMG_WIDTH)),
-    transforms.ToTensor(), # Converts to [0, 1] and (C, H, W)
-    transforms.Normalize((0.5,), (0.5,)) # Normalize to [-1, 1]
-])
+
 
 class Im2LatexDataset(Dataset):
     def __init__(self, df, tokenizer, transform):
@@ -308,6 +375,10 @@ class PreprocessedIm2LatexDataset(Dataset):
 
     def __getitem__(self, idx):
         # Data is already a tuple of (image_tensor, formula_tensor)
+        # image, formula = self.data[idx]
+        # if len(formula) > MAX_SEQ_LEN:
+        #     formula = torch.cat([formula[:MAX_SEQ_LEN-1], formula[-1:]])
+        # return image, formula
         return self.data[idx]
 
 class CollateFn:
@@ -433,14 +504,15 @@ class ViTEncoder(nn.Module):
         
     def forward(self, images):
         # images: (B, 1, H, W)
-        # Pad to square, then resize to 224x224
         _, _, H, W = images.shape
-        if H != W:
-            size = max(H, W)
-            # center the image
-            padding = ((size - W) // 2, size - W - (size - W) // 2, (size - H) // 2, size - H - (size - H) // 2)
-            images = F.pad(images, padding, mode='constant', value=1) # Pad with white (1)
-        images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
+        if H != 224 or W != 224:
+            # Pad to square, then resize to 224x224
+            if H != W:
+                size = max(H, W)
+                # center the image
+                padding = ((size - W) // 2, size - W - (size - W) // 2, (size - H) // 2, size - H - (size - H) // 2)
+                images = F.pad(images, padding, mode='constant', value=1) # Pad with white (1)
+            images = F.interpolate(images, size=(224, 224), mode='bilinear', align_corners=False)
         
         # Repeat 1 channel to 3 channels
         images = images.repeat(1, 3, 1, 1)
@@ -671,19 +743,151 @@ class LSTMDecoder(nn.Module):
                 
         return outputs
 
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=512):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (B, Seq_Len, Dim)
+        # pe: (Max_Len, Dim) -> slice to (Seq_Len, Dim) -> unsqueeze for batch
+        x = x + self.pe[:x.size(1), :].unsqueeze(0) #type: ignore
+        return self.dropout(x)
+    
+class TransformerDecoder(nn.Module):
+    def __init__(self, vocab_size, decoder_hidden_dim, encoder_dim, num_heads=8, num_layers=4, max_len=512, dropout_p=0.1):
+        super(TransformerDecoder, self).__init__()
+        self.vocab_size = vocab_size
+        self.decoder_hidden_dim = decoder_hidden_dim
+        
+        # 1. Project Encoder Output if dimensions differ
+        self.encoder_proj = nn.Linear(encoder_dim, decoder_hidden_dim)
+        
+        # 2. Embeddings and Positional Encoding
+        # Note: In Transformers, we use decoder_hidden_dim as d_model
+        self.embedding = nn.Embedding(vocab_size, decoder_hidden_dim)
+        self.pos_encoder = PositionalEncoding(decoder_hidden_dim, dropout_p, max_len)
+        
+        # 3. Transformer Decoder Blocks
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=decoder_hidden_dim, 
+            nhead=num_heads, 
+            dim_feedforward=decoder_hidden_dim * 4, 
+            dropout=dropout_p, 
+            batch_first=True
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+        
+        # 4. Final Head
+        self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
+
+    def generate_square_subsequent_mask(self, sz, device):
+        """Generates a triangular mask to prevent attending to future tokens."""
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask.to(device)
+
+    def forward(self, encoder_out, targets, teacher_forcing_ratio=1.0):
+        """
+        encoder_out: (B, num_pixels, encoder_dim)
+        targets: (B, max_seq_len)
+        """
+        B, seq_len = targets.shape
+        # truncate seq_len to max_len of positional encoding
+        # if seq_len > self.pos_encoder.pe.size(0): #type: ignore
+        #     seq_len = self.pos_encoder.pe.size(0) #type: ignore
+        #     targets = targets[:, :seq_len]
+        memory = self.encoder_proj(encoder_out) # (B, num_pixels, decoder_hidden_dim)
+
+        # --- TRAINING MODE (Fast Parallel with Shifted Inputs) ---
+        if teacher_forcing_ratio == 1.0:
+            # IMPORTANT: Shift inputs right! 
+            # Input:  [SOS, A, B, C]
+            # Target: [A, B, C, EOS] (Handled by your loss function)
+            tgt_inputs = targets[:, :-1] # Exclude the last token (EOS) for input
+            
+            
+            # Embed the inputs
+            tgt_emb = self.embedding(tgt_inputs)
+            tgt_emb *= math.sqrt(self.decoder_hidden_dim)
+            tgt_emb = self.pos_encoder(tgt_emb)
+            
+            # Create Causal Mask for the shifted length (seq_len - 1)
+            tgt_mask = self.generate_square_subsequent_mask(tgt_inputs.size(1), targets.device)
+            
+            # Pass through Transformer
+            # output shape: (B, seq_len - 1, dim)
+            trans_out = self.transformer_decoder(
+                tgt=tgt_emb, 
+                memory=memory, 
+                tgt_mask=tgt_mask
+            )
+            
+            # Project to Vocab: (B, seq_len - 1, vocab_size)
+            logits = self.fc_out(trans_out)
+            
+            # --- PADDING FOR COMPATIBILITY ---
+            # Your train_one_epoch loop expects output shape (B, seq_len, vocab_size)
+            # and calculates loss on outputs[:, 1:].
+            # So we pad the START of the sequence so our predictions align with targets[:, 1:]
+            
+            outputs = torch.zeros(B, seq_len, self.vocab_size).to(targets.device)
+            outputs[:, 1:, :] = logits # Fill from index 1 onwards
+            
+            return outputs
+
+        # --- INFERENCE MODE (Autoregressive Loop) ---
+        else:
+            # Start with <sos>
+            generated_seq = targets[:, 0].unsqueeze(1) # (B, 1)
+            outputs = torch.zeros(B, seq_len, self.vocab_size).to(targets.device)
+            
+            for t in range(seq_len):
+                # Prepare current sequence
+                tgt_emb = self.embedding(generated_seq)
+                tgt_emb *= math.sqrt(self.decoder_hidden_dim)
+                tgt_emb = self.pos_encoder(tgt_emb)
+                tgt_mask = self.generate_square_subsequent_mask(generated_seq.size(1), targets.device)
+                
+                # Run Transformer
+                transformer_out = self.transformer_decoder(tgt=tgt_emb, memory=memory, tgt_mask=tgt_mask)
+                
+                # Predict next token from the *last* position
+                last_token_out = transformer_out[:, -1, :] # (B, dim)
+                logits = self.fc_out(last_token_out)       # (B, vocab)
+                outputs[:, t, :] = logits                  # Store prediction at current step
+                
+                # Greedy Decoding
+                if t < seq_len - 1:
+                    next_token = logits.argmax(1).unsqueeze(1)
+                    generated_seq = torch.cat([generated_seq, next_token], dim=1)
+
+            return outputs
+
+    def __repr__(self):
+        return "TransformerDecoder"
+
 class Im2LatexModel(nn.Module):
-    def __init__(self, encoder, decoder, resume=False):
+    def __init__(self, encoder, decoder, resume=False, postfix=""):
         super(Im2LatexModel, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
         # self.encoder_trainable = True
 
-        checkpoint_path = f"im2latex_best_model_{self}_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth"
+        checkpoint_path = f"im2latex_best_model_{self}{postfix}.pth"
         if resume and os.path.exists(checkpoint_path):
             self.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
             print(f"Checkpoint loaded from {checkpoint_path}.")
         else:
-            print("Starting training from scratch...")
+            print("Initializing model from scratch...")
     
     def __repr__(self):
         return f"{self.encoder}-{self.decoder}"
@@ -708,8 +912,262 @@ class Im2LatexModel(nn.Module):
     #         self.encoder.eval()
         
     #     print(f"Encoder trainable set to {trainable}.")
+SYNONYMS = {
+
+}
+
+
+# def compute_synonym_loss(logits, targets, criterion, synonym_map, vocab_size):
+#     """
+#     logits: (Batch * Seq, VocabSize) - The raw model outputs
+#     targets: (Batch * Seq) - The ground truth indices
+#     """
+#     # 1. Start with hard one-hot targets
+#     # If target is index 5, this vector is [0, 0, 0, 0, 0, 1.0, 0, ...]
+#     target_probs = F.one_hot(targets, num_classes=vocab_size).float()
+    
+#     # 2. Soften the targets for synonyms
+#     for original_idx, synonym_idx in synonym_map.items():
+#         # Find all positions where the ground truth is the 'original' token
+#         mask = (targets == original_idx)
+        
+#         if mask.any():
+#             # Instead of 100% confidence on the original token, split it.
+#             # You can tune this ratio (e.g., 0.5/0.5 or 0.8/0.2)
+#             target_probs[mask, original_idx] = 0.5
+#             target_probs[mask, synonym_idx]  = 0.5
+
+#     # 3. Apply standard Label Smoothing (Optional but recommended)
+#     # If you want global smoothing (e.g., 0.1) on top of synonym splitting:
+#     # This ensures even non-synonyms don't get 100% probability.
+#     smoothing = 0.1
+#     # distribute 0.1 uniformly across all tokens
+#     target_probs = target_probs * (1 - smoothing) + (smoothing / vocab_size)
+
+#     # 4. Calculate Cross Entropy
+#     # Important: When passing probabilities (soft labels) to CrossEntropyLoss,
+#     # the input logits must be raw (not softmaxed), and the target must be the probability matrix.
+#     # Note: This requires PyTorch 1.10+
+#     return criterion(logits, target_probs)
 
 # --- Training and Evaluation Loops ---
+
+def beam_search_decode(mdl, images, beam_width=5, max_len=150):
+    """
+    Performs Beam Search for a BATCH of images using fully batched operations.
+    Effective batch size becomes (B * beam_width).
+    
+    Args:
+        model: The Im2LatexModel.
+        images: Tensor of shape (B, C, H, W).
+        beam_width: Number of beams to keep.
+        max_len: Maximum sequence length.
+        
+    Returns:
+        top_hypotheses: List of length B, where each element is the best hypothesis (list of token indices).
+    """
+    mdl.eval()
+    with torch.no_grad():
+        model = mdl.module if isinstance(mdl, nn.DataParallel) else mdl
+
+        B = images.size(0)
+        if beam_width == 1:
+            # Create a zero target tensor with <sos> token
+            zero_target = torch.full((B, max_len), PAD_TOKEN, device=DEVICE).long()
+            zero_target[:, 0] = SOS_TOKEN  # Set the first token to <sos>
+            
+            # Forward pass with teacher forcing ratio = 0
+            outputs = model(images, zero_target, teacher_forcing_ratio=0)
+            
+            # Get the predicted indices
+            preds_idx = outputs.argmax(dim=2)  # (B, max_len)
+            # Convert to list of lists
+            return preds_idx.tolist()
+        
+        # 1. Encode images
+        # encoder_out: (B, num_pixels, encoder_dim)
+        encoder_out = model.encoder(images)
+        vocab_size = model.decoder.vocab_size
+
+    
+        
+        # --- Initialize Decoder State (Batch Size B) ---
+        if isinstance(model.decoder, AttentionDecoder):
+            h, c = model.decoder.init_hidden_state(encoder_out)
+            state = (h, c)
+        elif isinstance(model.decoder, LSTMDecoder):
+            h, c = model.decoder.init_hidden_state(encoder_out)
+            state = (h, c)
+        elif isinstance(model.decoder, TransformerDecoder):
+            # Transformer is stateless in the RNN sense, but needs memory
+            memory = model.decoder.encoder_proj(encoder_out)
+            state = memory # State is just the memory
+        else:
+            raise ValueError("Unknown decoder type")
+
+        # --- First Step (t=0) ---
+        # We start with B beams (1 per image). We will expand to B*k after the first step.
+        start_token = torch.tensor([SOS_TOKEN] * B, device=DEVICE).long() # (B,)
+        
+        if isinstance(model.decoder, AttentionDecoder):
+            h, c = state
+            emb = model.decoder.embedding(start_token) # (B, emb_dim)
+            context, alpha = model.decoder.attention(encoder_out, h)
+            lstm_in = torch.cat((emb, context), dim=1)
+            h_new, c_new = model.decoder.lstm_cell(lstm_in, (h, c))
+            out = model.decoder.fc_out(h_new)
+            log_probs = F.log_softmax(out, dim=1) # (B, V)
+            state = (h_new, c_new)
+            
+        elif isinstance(model.decoder, LSTMDecoder):
+            h, c = state
+            emb = model.decoder.embedding(start_token)
+            h_new, c_new = model.decoder.lstm_cell(emb, (h, c))
+            out = model.decoder.fc_out(h_new)
+            log_probs = F.log_softmax(out, dim=1)
+            state = (h_new, c_new)
+            
+        elif isinstance(model.decoder, TransformerDecoder):
+            # Input: [SOS] (B, 1)
+            tgt = start_token.unsqueeze(1)
+            tgt_emb = model.decoder.embedding(tgt) * math.sqrt(model.decoder.decoder_hidden_dim)
+            tgt_emb = model.decoder.pos_encoder(tgt_emb)
+            tgt_mask = model.decoder.generate_square_subsequent_mask(1, DEVICE)
+            
+            trans_out = model.decoder.transformer_decoder(tgt=tgt_emb, memory=state, tgt_mask=tgt_mask)
+            # Last token output
+            out = model.decoder.fc_out(trans_out[:, -1, :])
+            log_probs = F.log_softmax(out, dim=1)
+            # State (memory) remains same
+            
+        # --- Expand to Beam Width ---
+        # Get top k candidates for each of the B images
+        topk_log_probs, topk_indices = log_probs.topk(beam_width, dim=1) # (B, k)
+        
+        # Initialize Beam Scores: Flatten to (B*k,)
+        beam_scores = topk_log_probs.view(-1) 
+        
+        # Initialize Sequences: (B*k, 1)
+        seqs = topk_indices.view(-1, 1)
+        
+        # Expand Encoder Out: (B, ...) -> (B*k, ...)
+        # We repeat each batch item k times: [Img1, Img1, ..., Img2, Img2, ...]
+        encoder_out = encoder_out.unsqueeze(1).expand(B, beam_width, *encoder_out.shape[1:]).reshape(B * beam_width, *encoder_out.shape[1:])
+        
+        # Expand State
+        if isinstance(state, tuple): # RNN
+            h, c = state
+            h = h.unsqueeze(1).expand(B, beam_width, -1).reshape(B * beam_width, -1)
+            c = c.unsqueeze(1).expand(B, beam_width, -1).reshape(B * beam_width, -1)
+            state = (h, c)
+        else: # Transformer Memory
+            state = state.unsqueeze(1).expand(B, beam_width, *state.shape[1:]).reshape(B * beam_width, *state.shape[1:])
+            
+        # --- Loop ---
+        for step in range(1, max_len):
+            # Input is the last token of each beam
+            last_tokens = seqs[:, -1] # (B*k,)
+            
+            # Check for finished beams (EOS)
+            is_finished = (last_tokens == EOS_TOKEN) # (B*k,)
+            
+            # If all beams are finished, we could stop, but some might be unfinished.
+            # We continue until max_len.
+            
+            # --- Decoder Step (Batch Size B*k) ---
+            if isinstance(model.decoder, AttentionDecoder):
+                h, c = state
+                emb = model.decoder.embedding(last_tokens)
+                context, alpha = model.decoder.attention(encoder_out, h)
+                lstm_in = torch.cat((emb, context), dim=1)
+                h_new, c_new = model.decoder.lstm_cell(lstm_in, (h, c))
+                out = model.decoder.fc_out(h_new)
+                log_probs = F.log_softmax(out, dim=1)
+                state_new = (h_new, c_new)
+                
+            elif isinstance(model.decoder, LSTMDecoder):
+                h, c = state
+                emb = model.decoder.embedding(last_tokens)
+                h_new, c_new = model.decoder.lstm_cell(emb, (h, c))
+                out = model.decoder.fc_out(h_new)
+                log_probs = F.log_softmax(out, dim=1)
+                state_new = (h_new, c_new)
+                
+            elif isinstance(model.decoder, TransformerDecoder):
+                # Construct full input: [SOS] + seqs
+                sos_tokens = torch.tensor([SOS_TOKEN] * (B * beam_width), device=DEVICE).unsqueeze(1)
+                tgt = torch.cat([sos_tokens, seqs], dim=1) # (B*k, seq_len)
+                
+                tgt_emb = model.decoder.embedding(tgt) * math.sqrt(model.decoder.decoder_hidden_dim)
+                tgt_emb = model.decoder.pos_encoder(tgt_emb)
+                tgt_mask = model.decoder.generate_square_subsequent_mask(tgt.size(1), DEVICE)
+                
+                trans_out = model.decoder.transformer_decoder(tgt=tgt_emb, memory=state, tgt_mask=tgt_mask)
+                out = model.decoder.fc_out(trans_out[:, -1, :])
+                log_probs = F.log_softmax(out, dim=1)
+                state_new = state # Memory unchanged
+            
+            # --- Handle Finished Beams ---
+            # If a beam is finished, we force it to predict EOS (or PAD) with prob 1 (log_prob 0)
+            # and everything else -inf. This keeps the score constant and prevents expansion.
+            if is_finished.any():
+                log_probs[is_finished, :] = -float('inf')
+                log_probs[is_finished, EOS_TOKEN] = 0.0
+            
+            # --- Calculate Scores ---
+            # beam_scores: (B*k,)
+            # log_probs: (B*k, V)
+            # Add current step log probs to accumulated scores
+            next_scores = beam_scores.unsqueeze(1) + log_probs # (B*k, V)
+            
+            # Reshape to (B, k*V) to select top k across all extensions of the k beams for each image
+            next_scores = next_scores.view(B, beam_width * vocab_size)
+            
+            # Top K
+            topk_scores, topk_ids = next_scores.topk(beam_width, dim=1) # (B, k)
+            
+            # Decode IDs
+            # topk_ids is index in [0, k*V - 1]
+            prev_beam_indices = topk_ids // vocab_size # (B, k) [0..k-1]
+            new_token_indices = topk_ids % vocab_size # (B, k)
+            
+            # Update Scores
+            beam_scores = topk_scores.view(-1) # (B*k,)
+            
+            # --- Gather and Update State/Sequences ---
+            # We need to map (b, k_idx) -> global_idx in (B*k)
+            batch_offset = torch.arange(B, device=DEVICE).unsqueeze(1) * beam_width
+            gather_indices = (batch_offset + prev_beam_indices).view(-1) # (B*k,)
+            
+            # Update State
+            if isinstance(state_new, tuple):
+                h, c = state_new
+                h = h[gather_indices]
+                c = c[gather_indices]
+                state = (h, c)
+            else:
+                state = state_new[gather_indices]
+                
+            # Update Encoder Out (needed for Attention)
+            encoder_out = encoder_out[gather_indices]
+            
+            # Update Sequences
+            seqs = seqs[gather_indices] # Select the parent sequences
+            new_tokens = new_token_indices.view(-1, 1)
+            seqs = torch.cat([seqs, new_tokens], dim=1) # Append new tokens
+            
+        # --- Final Selection ---
+        # The 0-th beam for each batch is the best because topk sorts by score (descending).
+        best_indices = torch.arange(0, B * beam_width, beam_width, device=DEVICE)
+        best_seqs = seqs[best_indices]
+        
+        # Convert to list of lists and prepend SOS
+        best_seqs_list = best_seqs.tolist()
+        final_output = []
+        for s in best_seqs_list:
+            final_output.append([SOS_TOKEN] + s)
+            
+        return final_output
 
 def train_one_epoch(model, loader, optimizer, criterion, clip, teacher_forcing_ratio):
     model.train()
@@ -753,7 +1211,9 @@ def train_one_epoch(model, loader, optimizer, criterion, clip, teacher_forcing_r
         
     return epoch_loss / len(loader)
 
-def evaluate(model, loader, criterion, tokenizer):
+
+
+def evaluate(model, loader, criterion, tokenizer, beamer_width=1):
     model.eval()
     epoch_loss = 0
     
@@ -762,14 +1222,19 @@ def evaluate(model, loader, criterion, tokenizer):
     exact_match_count = 0
     
     with torch.no_grad():
-        # pbar = tqdm(loader, desc="Evaluating")
-        pbar = loader
+        pbar = tqdm(loader, desc="Evaluating", maxinterval=60)
+        # pbar = loader
         for images, targets in pbar:
             images = images.to(DEVICE)
             targets = targets.to(DEVICE)
+
+            real_model = model.module if isinstance(model, nn.DataParallel) else model
+            if isinstance(real_model.decoder, TransformerDecoder):
+                if targets.shape[1] > MAX_SEQ_LEN:
+                    targets = targets[:, :MAX_SEQ_LEN]
             
             # Forward pass with no teacher forcing
-            outputs = model(images, targets, teacher_forcing_ratio=0.0)
+            outputs = model(images, targets, teacher_forcing_ratio=1.0)
             
             # Calculate loss
             loss = criterion(
@@ -780,10 +1245,11 @@ def evaluate(model, loader, criterion, tokenizer):
             
             # Decode predictions for metrics
             # Greedy decoding
-            preds_idx = outputs.argmax(dim=2) # (B, max_len)
+            # preds_idx = outputs.argmax(dim=2) # (B, max_len)
+            preds_idx = beam_search_decode(model, images, beam_width=beamer_width, max_len=targets.shape[1])
             
             for i in range(targets.shape[0]):
-                pred_str = tokenizer.inverse_transform(preds_idx[i].cpu().numpy())
+                pred_str = tokenizer.inverse_transform(preds_idx[i])
                 true_str = tokenizer.inverse_transform(targets[i].cpu().numpy())
                 
                 hypotheses.append(pred_str.split())
@@ -791,6 +1257,12 @@ def evaluate(model, loader, criterion, tokenizer):
                 
                 if pred_str == true_str:
                     exact_match_count += 1
+                
+                # if i % 100 == 0:
+                #     with open("debug_predictions.txt", "a") as f:
+                #         # print the whole matrix, no truncation
+                #         f.write(str(images[i].cpu().numpy()) + "\n")
+                #     exit(0)
                     
     # Calculate metrics
     val_loss = epoch_loss / len(loader)
@@ -817,131 +1289,6 @@ def evaluate(model, loader, criterion, tokenizer):
     
     return val_loss, bleu_score, exact_match, ned_score
 
-def test(encoder_type, decoder_type):
-    """
-    load the im2latex best model and evaluate on test set
-    """
-    print("Loading and preprocessing data for testing...")
-    
-    # Build tokenizer
-    print("Building tokenizer...")
-    VOCAB_PATH = os.path.join(DATA_DIR, 'vocab.json')
-    tokenizer = Tokenizer(min_freq=5)
-
-    if os.path.exists(VOCAB_PATH):
-        print(f"Loading vocabulary from {VOCAB_PATH}...")
-        tokenizer.load(VOCAB_PATH)
-        print(f"Vocabulary loaded. Total size: {tokenizer.vocab_size}")
-    else:
-        print("Error: Vocabulary not found. Please run training first.")
-        return
-
-    VOCAB_SIZE = tokenizer.vocab_size
-
-    # Ensure test data is preprocessed
-    if not os.path.exists(TEST_PT_PATH):
-        print(f"Pre-processed Test data not found at {TEST_PT_PATH}.")
-        print("Running one-time pre-processing for Test data...")
-        df = load_data(TEST_CSV_PATH, IMG_DIR)
-        temp_dataset = Im2LatexDataset(df, tokenizer, image_transform)
-        temp_loader = DataLoader(temp_dataset, batch_size=1, shuffle=False, num_workers=NUM_WORKERS, pin_memory=False)
-        processed_data = []
-        for batch in tqdm(temp_loader, desc="Processing Test data"):
-            image_tensor, formula_tensor = batch
-            processed_data.append((image_tensor.squeeze(0).clone(), formula_tensor.squeeze(0).clone()))
-        torch.save(processed_data, TEST_PT_PATH)
-    
-    # Load Test DataLoader
-    test_dataset = PreprocessedIm2LatexDataset(TEST_PT_PATH)
-    collate_fn = CollateFn(PAD_TOKEN)
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        collate_fn=collate_fn
-    )
-
-    print("Initializing model...")
-    # Initialize models
-    if encoder_type == "cnn_encoder":
-        encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
-    elif encoder_type == "resnet_encoder":
-        encoder = ResNetEncoder(encoded_image_size=16).to(DEVICE)
-    elif encoder_type == "vit_encoder":
-        encoder = ViTEncoder().to(DEVICE)
-    else:
-        raise ValueError("Unsupported encoder type")
-
-    # Determine encoder output dimension dynamically
-    with torch.no_grad():
-        dummy = torch.zeros(1, 1, IMG_HEIGHT, IMG_WIDTH).to(DEVICE)
-        enc_out = encoder(dummy)
-    detected_encoder_dim = enc_out.shape[2]
-
-    if decoder_type == "attention_decoder":
-        decoder = AttentionDecoder(
-            vocab_size=VOCAB_SIZE,
-            embedding_dim=EMBEDDING_DIM,
-            decoder_hidden_dim=DECODER_HIDDEN_DIM,
-            encoder_dim=detected_encoder_dim,
-            attention_dim=ATTENTION_DIM,
-            dropout_p=DROPOUT
-        ).to(DEVICE)
-    elif decoder_type == "lstm_decoder":
-        decoder = LSTMDecoder(
-            vocab_size=VOCAB_SIZE,
-            embedding_dim=EMBEDDING_DIM,
-            decoder_hidden_dim=DECODER_HIDDEN_DIM,
-            encoder_dim=detected_encoder_dim,
-            dropout_p=DROPOUT
-        ).to(DEVICE)
-    else:
-        raise ValueError("Unsupported decoder type")
-
-    model = Im2LatexModel(encoder, decoder, resume=False).to(DEVICE)
-    
-    if torch.cuda.device_count() > 1:
-        model = nn.DataParallel(model)
-
-    # Load best model weights
-    checkpoint_path = f"im2latex_best_model_{model.module if isinstance(model, nn.DataParallel) else model}_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth"
-    if os.path.exists(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
-        print(f"Loaded best model from {checkpoint_path}")
-    else:
-        print(f"Error: Checkpoint {checkpoint_path} not found.")
-        return
-
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
-
-    print("Starting evaluation on test set...")
-    test_loss, test_bleu, test_em, test_ned = evaluate(
-        model,
-        test_loader,
-        criterion,
-        tokenizer
-    )
-    
-    print(f"\n--- Test Set Evaluation ---")
-    print(f"Test Loss: {test_loss:.4f}")
-    print(f"Test BLEU-4: {test_bleu:.4f}")
-    print(f"Test Exact Match: {test_em:.4f}")
-    print(f"Test NED: {test_ned:.4f}")
-
-    results = {
-        "test_loss": test_loss,
-        "test_bleu": test_bleu,
-        "test_em": test_em,
-        "test_ned": test_ned
-    }
-    
-    output_file = f"test_results_{model.module if isinstance(model, nn.DataParallel) else model}.json"
-    with open(output_file, "w") as f:
-        json.dump(results, f, indent=4)
-    print(f"Results saved to {output_file}")
-
 def get_teacher_forcing_ratio(epoch, max_tfr, min_tfr, total_epochs):
     """Linearly decays teacher forcing ratio from max_tfr to min_tfr over total_epochs."""
     # Warmup for first 5% of epochs
@@ -956,6 +1303,12 @@ def get_teacher_forcing_ratio(epoch, max_tfr, min_tfr, total_epochs):
         
     # Floor at 0.3 for the rest
     return min_tfr
+
+def get_image_size(encoder_type, decoder_type=None):
+    if encoder_type in ["vit_encoder", "vitencoder"]:
+        return (224, 224)
+    else:
+        return (96, 512)
 
 def main(encoder_type, decoder_type, resume=False):
     print("Loading and preprocessing data...")
@@ -978,6 +1331,38 @@ def main(encoder_type, decoder_type, resume=False):
     # Create a smaller subset for faster prototyping (e.g., 20k)
     # df = df.sample(n=20000, random_state=SEED).reset_index(drop=True)
     # print(f"Using a subset of {len(df)} samples for demonstration.")
+
+    # Define image transformations
+    IMG_HEIGHT, IMG_WIDTH = get_image_size(encoder_type, decoder_type)
+
+    if encoder_type == "vit_encoder":
+        global BATCH_SIZE
+        BATCH_SIZE //= 2
+
+    if decoder_type == "transformer_decoder":
+        # For Transformers, use full teacher forcing during training
+        MAX_TEACHER_FORCING_RATIO = 1.0
+        MIN_TEACHER_FORCING_RATIO = 1.0
+        WEIGHT_DECAY = 1e-4
+    else:
+        MAX_TEACHER_FORCING_RATIO = 1.0
+        MIN_TEACHER_FORCING_RATIO = 0.3
+        WEIGHT_DECAY = 1e-4
+
+    
+    image_transform = transforms.Compose([
+        transforms.RandomApply([
+        transforms.RandomAffine(
+            degrees=1,              # Rotate between -1 and +1 degrees
+            translate=(0.01, 0.01), # Shift vertically/horizontally by max 1%
+            scale=(0.95, 1.05),     # Zoom between 95% and 105%
+            shear=1                 # Shear (slant) by max 1 degree
+        )
+        ], p=0.5),
+        ResizeAndPad((IMG_HEIGHT, IMG_WIDTH)),
+        transforms.ToTensor(), # Converts to [0, 1] and (C, H, W)
+        transforms.Normalize((0.5,), (0.5,)) # Normalize to [-1, 1]
+    ])
     
     # Build tokenizer
     print("Building tokenizer...")
@@ -1024,7 +1409,7 @@ def main(encoder_type, decoder_type, resume=False):
             processed_data = []
             # This loop is now just appending, while the workers
             # are doing the hard work in the background.
-            for batch in tqdm(temp_loader, desc=f"Processing {name} data"):
+            for batch in tqdm(temp_loader, desc=f"Processing {name} data", mininterval=60):
                 image_tensor, formula_tensor = batch
                 # Squeeze the batch_size=1 dimension
                 processed_data.append(
@@ -1036,6 +1421,7 @@ def main(encoder_type, decoder_type, resume=False):
             print(f"Saved pre-processed {name} data to {pt_path}.")
         else:
             print(f"Found pre-processed {name} data at {pt_path}.")
+    
 
     # 4. Get DataLoaders
     # Now load directly from the pre-processed .pt files
@@ -1047,15 +1433,27 @@ def main(encoder_type, decoder_type, resume=False):
         NUM_WORKERS,
         PAD_TOKEN
     )
-    
+
+    # print the first batch of test_loader for verification
+    # for _, formulas in test_loader:
+    #     for f in formulas[:20]:
+    #         print(tokenizer.inverse_transform(f.cpu().numpy()))
+    #         print("-----")
+        # exit(0)
     print("Initializing model...")
     # Initialize models
     if encoder_type == "cnn_encoder":
         encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
-        encoder_lr = 1e-3
+        if resume:
+            encoder_lr = 1e-4
+        else:
+            encoder_lr = 1e-3
     elif encoder_type == "resnet_encoder":
         encoder = ResNetEncoder(encoded_image_size=16).to(DEVICE)
-        encoder_lr = 1e-3
+        if resume:
+            encoder_lr = 1e-4
+        else:
+            encoder_lr = 1e-3
     elif encoder_type == "vit_encoder":
         encoder = ViTEncoder().to(DEVICE)
         encoder_lr = 1e-4
@@ -1078,24 +1476,53 @@ def main(encoder_type, decoder_type, resume=False):
             attention_dim=ATTENTION_DIM,
             dropout_p=DROPOUT
         ).to(DEVICE)
-        decoder_lr=1e-3
+        if resume:
+            decoder_lr=1e-4
+        else:
+            decoder_lr=1e-3
     elif decoder_type == "lstm_decoder":
         decoder = LSTMDecoder(
             vocab_size=VOCAB_SIZE,
             embedding_dim=EMBEDDING_DIM,
             decoder_hidden_dim=DECODER_HIDDEN_DIM,
             encoder_dim=detected_encoder_dim,
-            dropout_p=DROPOUT
+            dropout_p=0.1
         ).to(DEVICE)
-        decoder_lr=1e-3
+        if resume:
+            decoder_lr=1e-4
+        else:
+            decoder_lr=1e-3
+    elif decoder_type == "transformer_decoder":
+        # Transformer Parameters
+        # NUM_HEADS = 4
+        # NUM_LAYERS = 3
+        NUM_HEADS = 8
+        NUM_LAYERS = 3
+        # Note: DECODER_HIDDEN_DIM should be divisible by NUM_HEADS
+        
+        decoder = TransformerDecoder(
+            vocab_size=VOCAB_SIZE,
+            decoder_hidden_dim=256, 
+            encoder_dim=detected_encoder_dim,
+            num_heads=NUM_HEADS,
+            num_layers=NUM_LAYERS,
+            max_len=MAX_SEQ_LEN,
+            dropout_p=0.3
+        ).to(DEVICE)
+        if resume:
+            decoder_lr = 5e-5
+        else:
+            decoder_lr = 1e-4
     else:
         raise ValueError("Unsupported decoder type")
 
-    model = Im2LatexModel(encoder, decoder, resume).to(DEVICE)
+    model = Im2LatexModel(encoder, decoder, resume, postfix=f"_small_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}").to(DEVICE)
 
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
         model = nn.DataParallel(model)
+    else:
+        print("Using a single GPU or CPU.")
 
     print(f"Model initialized: {model.module if isinstance(model, nn.DataParallel) else model}")
     
@@ -1106,19 +1533,29 @@ def main(encoder_type, decoder_type, resume=False):
     ]
     
     optimizer = optim.Adam(optimizer_grouped_parameters, weight_decay=WEIGHT_DECAY)
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN, label_smoothing=LABEL_SMOOTHING).to(DEVICE)
 
     # Add a scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, 
-        # mode='max',  # Monitor val BLEU + EM - NED
-        mode='min', # Monitor val loss
-        factor=0.5,  
-        patience=4,
-        cooldown=2,
-        min_lr=[5e-6, 5e-5]
-    )
-    
+    if resume:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='max',  # Monitor val BLEU + EM - NED
+            # mode='min', # Monitor val loss
+            factor=0.5,  
+            patience=4,
+            cooldown=2,
+            min_lr=[1e-6, 1e-6]
+        )
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            # mode='max',  # Monitor val BLEU + EM - NED
+            mode='min', # Monitor val loss
+            factor=0.5,  
+            patience=4,
+            cooldown=2,
+            min_lr=[1e-5, 1e-5]
+        )
     print("Starting training...")
     best_bleu = 0.0
     best_em = 0.0
@@ -1131,6 +1568,18 @@ def main(encoder_type, decoder_type, resume=False):
     for epoch in range(1, EPOCHS + 1):
         print(f"\n--- Epoch {epoch}/{EPOCHS} ---")
 
+        # if decoder_type == "transformer_decoder":
+        if 0:
+            if epoch <= 5:
+                warm_lr = 1e-5
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = warm_lr
+                print(f"Warm start: Learning rate set to {warm_lr}")
+            elif epoch == 6:
+                optimizer.param_groups[0]['lr'] = encoder_lr
+                optimizer.param_groups[1]['lr'] = decoder_lr
+                print(f"Warm start finished. Restored learning rates: Encoder={encoder_lr}, Decoder={decoder_lr}")
+
         tf_decay = (MAX_TEACHER_FORCING_RATIO - MIN_TEACHER_FORCING_RATIO) / TF_ANNEAL_EPOCHS
         current_tf_ratio = get_teacher_forcing_ratio(
             epoch,
@@ -1140,14 +1589,7 @@ def main(encoder_type, decoder_type, resume=False):
         )
         print(f"Using Teacher Forcing Ratio: {current_tf_ratio:.4f}")
 
-        # if encoder_type in ["resnet_encoder", "vit_encoder"]:
-        #     # Freeze encoder for first few epochs
-        #     encoder_trainable = epoch > 5
-        #     if not encoder_trainable:
-        #         print("Freezing encoder parameters for this epoch.")
-        # else:
-        #     encoder_trainable = True
-        
+       
         train_loss = train_one_epoch(
             model,
             train_loader,
@@ -1155,7 +1597,6 @@ def main(encoder_type, decoder_type, resume=False):
             criterion,
             CLIP_GRAD,
             current_tf_ratio
-            # encoder_trainable
         )
 
         train_record["loss"].append(train_loss)
@@ -1172,9 +1613,12 @@ def main(encoder_type, decoder_type, resume=False):
         val_record["em"].append(val_em)
         val_record["ned"].append(val_ned)
 
-        # scheduler.step(val_bleu + val_em - val_ned)  # Combine metrics for scheduling
-        if epoch > 5:
-            scheduler.step(val_loss)  # Use validation loss for scheduling
+
+        # scheduler_start_epoch = 5 if decoder_type == "transformer_decoder" else 2
+        scheduler_start_epoch = 2
+        if epoch > scheduler_start_epoch:
+            scheduler.step(val_bleu + val_em - val_ned)  # Combine metrics for scheduling
+            # scheduler.step(val_loss)  # Use validation loss for scheduling
         
         # print date and time
         current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -1192,7 +1636,7 @@ def main(encoder_type, decoder_type, resume=False):
             best_ned = min(best_ned, val_ned)
             
             model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-            torch.save(model_to_save.state_dict(), f"im2latex_best_model_{model_to_save}_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth")
+            torch.save(model_to_save.state_dict(), f"im2latex_best_model_{model_to_save}_small_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth")
 
             epochs_no_improve = 0
         else:
@@ -1206,12 +1650,13 @@ def main(encoder_type, decoder_type, resume=False):
     # load the best model for final evaluation
     print("Loading best model for final evaluation on test set...")
     model_to_load = model.module if isinstance(model, nn.DataParallel) else model
-    model_to_load.load_state_dict(torch.load(f"im2latex_best_model_{model_to_load}_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth", map_location=DEVICE))
+    model_to_load.load_state_dict(torch.load(f"im2latex_best_model_{model_to_load}_small_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth", map_location=DEVICE))
     test_loss, test_bleu, test_em, test_ned = evaluate(
         model,
         test_loader,
         criterion,
-        tokenizer
+        tokenizer,
+        beamer_width=5
     )
     print(f"\n--- Test Set Evaluation ---")
     print(f"Test Loss: {test_loss:.4f}")
@@ -1234,7 +1679,8 @@ def main(encoder_type, decoder_type, resume=False):
         "val": val_record,
         "test": test_record
     }
-    with open(f"{model}_records_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.json", "w") as f:
+    model_name = model.module if isinstance(model, nn.DataParallel) else model
+    with open(f"{model_name}_records_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.json", "w") as f:
         json.dump(records, f, indent=4)
     
 if __name__ == "__main__":
@@ -1242,9 +1688,10 @@ if __name__ == "__main__":
         print(f"Dataset not found in '{DATA_DIR}'.")
         print("Please follow the prerequisite steps to download and unzip the dataset.")
     else:
-        # main("resnet_encoder", "attention_decoder")
-        # main("resnet_encoder", "lstm_decoder")
-        # main("cnn_encoder", "lstm_decoder")
-        # main("cnn_encoder", "attention_decoder")
-        main("vit_encoder", "attention_decoder")
-        main("vit_encoder", "lstm_decoder")
+        # main("resnet_encoder", "attention_decoder", resume=True)
+        # main("resnet_encoder", "lstm_decoder", resume=True)
+        # main("cnn_encoder", "lstm_decoder", resume=True)
+        # main("cnn_encoder", "attention_decoder", resume=True)
+        # main("vit_encoder", "attention_decoder", resume=True)
+        # main("vit_encoder", "lstm_decoder", resume=True)
+        main("resnet_encoder", "transformer_decoder", resume=True)

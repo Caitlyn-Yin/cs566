@@ -8,12 +8,12 @@ import re
 
 # --- Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IMG_HEIGHT = 96
-IMG_WIDTH = 512
-ENCODER_DIM = 512  # Default for ResNet34
-EMBEDDING_DIM = 256
-DECODER_HIDDEN_DIM = 512
-ATTENTION_DIM = 512
+# IMG_HEIGHT = 96
+# IMG_WIDTH = 512
+# ENCODER_DIM = 512  # Default for ResNet34
+# EMBEDDING_DIM = 256
+# DECODER_HIDDEN_DIM = 512
+# ATTENTION_DIM = 512
 VOCAB_SIZE = 8000 # Placeholder, will be updated from checkpoint if possible or needs to match training
 
 # Special Tokens (Must match training)
@@ -29,11 +29,18 @@ UNK_TOKEN = 3
 # Let's try to import from main to ensure consistency.
 
 try:
+    # from main import (
+    #     CNNEncoder, ResNetEncoder, ViTEncoder,
+    #     AttentionDecoder, LSTMDecoder, TransformerDecoder,
+    #     Im2LatexModel, ResizeAndPad, 
+    #     Tokenizer, normalize_latex
+    # )
     from main import (
+        EMBEDDING_DIM, DECODER_HIDDEN_DIM, ATTENTION_DIM, DEVICE, MAX_SEQ_LEN,
         CNNEncoder, ResNetEncoder, ViTEncoder,
-        AttentionDecoder, LSTMDecoder, 
-        Im2LatexModel, ResizeAndPad, 
-        Tokenizer, normalize_latex
+        AttentionDecoder, LSTMDecoder, TransformerDecoder,
+        Im2LatexModel, Tokenizer, ResizeAndPad,
+        get_image_size, normalize_latex
     )
     # print("Successfully imported model classes from main.py")
 except ImportError:
@@ -95,6 +102,7 @@ def load_model(model_path):
     # Load tokenizer
     TRAIN_CSV_PATH = './im2latex100k/im2latex_train.csv'
     VOCAB_PATH = './im2latex100k/vocab.json'
+    # VOCAB_PATH = './im2latex100k/vocab_old.json'
     tokenizer = Tokenizer(min_freq=5)
 
     if os.path.exists(VOCAB_PATH):
@@ -121,7 +129,7 @@ def load_model(model_path):
             attention_dim=ATTENTION_DIM,
             dropout_p=0.3
         ).to(DEVICE)
-    else:
+    elif "lstm" in model_path.lower():
         decoder = LSTMDecoder(
             vocab_size=vocab_size,
             embedding_dim=EMBEDDING_DIM,
@@ -129,6 +137,22 @@ def load_model(model_path):
             encoder_dim=encoder_dim,
             dropout_p=0.3
         ).to(DEVICE)
+    elif "transformer" in model_path.lower():
+        # Transformer Parameters
+        NUM_HEADS = 8
+        NUM_LAYERS = 3
+        # Note: DECODER_HIDDEN_DIM should be divisible by NUM_HEADS
+        
+        decoder = TransformerDecoder(
+            vocab_size=vocab_size,
+            decoder_hidden_dim=256, 
+            encoder_dim=encoder_dim,
+            num_heads=NUM_HEADS,
+            num_layers=NUM_LAYERS,
+            max_len=MAX_SEQ_LEN,
+            dropout_p=0.3
+        ).to(DEVICE)
+        
 
     model = Im2LatexModel(encoder, decoder).to(DEVICE)
     
@@ -142,13 +166,14 @@ def load_model(model_path):
     model.eval()
     return model, tokenizer
 
-def process_image(image_path):
+def process_image(image_path, encoder_type):
     if not os.path.exists(image_path):
         print(f"Error: Image not found at {image_path}")
         return None
 
     img = Image.open(image_path).convert('L')
     
+    IMG_HEIGHT, IMG_WIDTH = get_image_size(encoder_type)
     # Transform
     transform = transforms.Compose([
         ResizeAndPad((IMG_HEIGHT, IMG_WIDTH)),
@@ -160,62 +185,101 @@ def process_image(image_path):
     return img_tensor
 
 def predict(model, image_tensor, tokenizer):
+    import math
     with torch.no_grad():
         # Encoder pass
         encoder_out = model.encoder(image_tensor)
         
-        # Decoder inference (greedy)
-        # We need to manually run the decoding loop since the model.forward 
-        # usually expects targets for training.
-        
         B = image_tensor.size(0)
         max_len = 150 # Max length for generated formula
         
-        # Initialize hidden state
-        if hasattr(model.decoder, 'init_hidden_state'):
-            h, c = model.decoder.init_hidden_state(encoder_out)
-        else:
-            # Fallback if method name differs
-            mean_encoder_out = encoder_out.mean(dim=1)
-            h = model.decoder.tanh(model.decoder.init_h(mean_encoder_out))
-            c = model.decoder.tanh(model.decoder.init_c(mean_encoder_out))
-            
-        # Start token
-        input_token = torch.tensor([SOS_TOKEN] * B).to(DEVICE)
-        
         decoded_indices = []
         
-        for t in range(max_len):
-            # Embed
-            if hasattr(model.decoder, 'embedding_dropout'):
-                 embedded = model.decoder.embedding_dropout(model.decoder.embedding(input_token))
-            else:
-                 embedded = model.decoder.embedding(input_token)
+        if isinstance(model.decoder, TransformerDecoder):
+            # --- Transformer Inference ---
+            # 1. Project Encoder Output
+            memory = model.decoder.encoder_proj(encoder_out)
+            
+            # 2. Start with SOS
+            generated_seq = torch.tensor([[SOS_TOKEN]] * B).to(DEVICE) # (B, 1)
+            
+            for t in range(max_len):
+                # Prepare input for this step
+                tgt_emb = model.decoder.embedding(generated_seq)
+                tgt_emb *= math.sqrt(model.decoder.decoder_hidden_dim)
+                tgt_emb = model.decoder.pos_encoder(tgt_emb)
+                
+                tgt_mask = model.decoder.generate_square_subsequent_mask(generated_seq.size(1), DEVICE)
+                
+                # Transformer Decoder Pass
+                # output: (B, seq_len, dim)
+                trans_out = model.decoder.transformer_decoder(
+                    tgt=tgt_emb, 
+                    memory=memory, 
+                    tgt_mask=tgt_mask
+                )
+                
+                # Get last token output
+                last_token_out = trans_out[:, -1, :] # (B, dim)
+                logits = model.decoder.fc_out(last_token_out) # (B, vocab)
+                
+                # Greedy
+                pred_token = logits.argmax(1) # (B,)
+                token_idx = pred_token.item()
+                
+                if token_idx == EOS_TOKEN:
+                    break
+                
+                decoded_indices.append(token_idx)
+                
+                # Append to sequence for next step
+                generated_seq = torch.cat([generated_seq, pred_token.unsqueeze(1)], dim=1)
 
-            # Step
-            if isinstance(model.decoder, AttentionDecoder):
-                context, alpha = model.decoder.attention(encoder_out, h)
-                lstm_input = torch.cat((embedded, context), dim=1)
-                h, c = model.decoder.lstm_cell(lstm_input, (h, c))
+        else:
+            # --- RNN Inference ---
+            # Initialize hidden state
+            if hasattr(model.decoder, 'init_hidden_state'):
+                h, c = model.decoder.init_hidden_state(encoder_out)
             else:
-                # LSTM Decoder
-                h, c = model.decoder.lstm_cell(embedded, (h, c))
+                # Fallback if method name differs
+                mean_encoder_out = encoder_out.mean(dim=1)
+                h = model.decoder.tanh(model.decoder.init_h(mean_encoder_out))
+                c = model.decoder.tanh(model.decoder.init_c(mean_encoder_out))
                 
-            # Output
-            if hasattr(model.decoder, 'fc_dropout'):
-                output = model.decoder.fc_dropout(model.decoder.fc_out(h))
-            else:
-                output = model.decoder.fc_out(h)
+            # Start token
+            input_token = torch.tensor([SOS_TOKEN] * B).to(DEVICE)
             
-            # Greedy argmax
-            pred_token = output.argmax(1)
-            
-            token_idx = pred_token.item()
-            if token_idx == EOS_TOKEN:
-                break
+            for t in range(max_len):
+                # Embed
+                if hasattr(model.decoder, 'embedding_dropout'):
+                     embedded = model.decoder.embedding_dropout(model.decoder.embedding(input_token))
+                else:
+                     embedded = model.decoder.embedding(input_token)
+
+                # Step
+                if isinstance(model.decoder, AttentionDecoder):
+                    context, alpha = model.decoder.attention(encoder_out, h)
+                    lstm_input = torch.cat((embedded, context), dim=1)
+                    h, c = model.decoder.lstm_cell(lstm_input, (h, c))
+                else:
+                    # LSTM Decoder
+                    h, c = model.decoder.lstm_cell(embedded, (h, c))
+                    
+                # Output
+                if hasattr(model.decoder, 'fc_dropout'):
+                    output = model.decoder.fc_dropout(model.decoder.fc_out(h))
+                else:
+                    output = model.decoder.fc_out(h)
                 
-            decoded_indices.append(token_idx)
-            input_token = pred_token
+                # Greedy argmax
+                pred_token = output.argmax(1)
+                
+                token_idx = pred_token.item()
+                if token_idx == EOS_TOKEN:
+                    break
+                    
+                decoded_indices.append(token_idx)
+                input_token = pred_token
             
         # Convert indices to string
         latex_str = tokenizer.inverse_transform(decoded_indices)
@@ -227,6 +291,8 @@ def main():
     # 1. Load Model
     model_path = input("Enter path to model checkpoint (leave empty for default): ").strip(' "\'')
     model, tokenizer = load_model(model_path)
+    assert model is not None, "Failed to load model."
+    encoder_type = model.encoder.__class__.__name__.lower()
     
     if model is None:
         print("Could not load model. Exiting.")
@@ -245,17 +311,19 @@ def main():
         if not image_path:
             continue
             
-        image_tensor = process_image(image_path)
+        image_tensor = process_image(image_path, encoder_type)  
         if image_tensor is None:
             continue
             
         print("Processing image...")
         try:
             latex_output = predict(model, image_tensor, tokenizer)
+            latex_output = normalize_latex(latex_output)
             # remove all spaces near []()\{\}^_
             latex_output = re.sub(r'\s*([\[\]\(\)\{\}\^_])\s*', r'\1', latex_output)
             # remove <space> token
             latex_output = latex_output.replace("<space>", " ")
+            latex_output = latex_output.replace(r"\bf ", "")
             latex_output = re.sub(r'\s+', ' ', latex_output).strip()
             print("\nPredicted LaTeX:")
             print(f"{latex_output}")
