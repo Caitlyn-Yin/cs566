@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LaTeX Equation OCR - CS566 Project</title>
+    <style>
+        /* --- CSS STYLES --- */
+        :root {
+            --primary-color: #c5050c; /* UW-Madison Red */
+            --secondary-color: #2c3e50;
+            --text-color: #333;
+            --bg-color: #fff;
+            --section-bg: #f9f9f9;
+            --code-bg: #f4f4f4;
+        }
+
+        body {
+            font-family: 'Lato', 'Segoe UI', sans-serif;
+            line-height: 1.6;
+            color: var(--text-color);
+            margin: 0;
+            padding: 0;
+        }
+
+
+        header {
+            background: #fff;
+            border-bottom: 1px solid #ddd;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+        }
+
+        nav {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .nav-brand {
+            font-weight: 700;
+            font-size: 1.2rem;
+            color: var(--secondary-color);
+            text-decoration: none;
+        }
+
+        .nav-links a {
+            margin-left: 20px;
+            text-decoration: none;
+            color: #555;
+            font-weight: 500;
+            font-size: 0.95rem;
+        }
+
+        .nav-links a:hover {
+            color: var(--primary-color);
+        }
+
+        .project-hero {
+            background-color: var(--section-bg);
+            padding: 60px 2rem;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+        }
+
+        .project-hero h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            color: var(--secondary-color);
+        }
+
+        .project-hero .subtitle {
+            font-size: 1.3rem;
+            color: #555;
+            margin-bottom: 30px;
+            font-weight: 300;
+        }
+
+        .authors {
+            display: flex;
+            justify-content: center;
+            gap: 40px;
+            flex-wrap: wrap;
+            font-size: 1.1rem;
+            margin-top: 20px;
+        }
+
+        .author-name {
+            font-weight: 600;
+            color: var(--primary-color);
+        }
+
+        section {
+            padding: 50px 2rem;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        .section-title {
+            font-size: 1.8rem;
+            color: var(--secondary-color);
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+            margin-bottom: 25px;
+        }
+
+        h3 {
+            color: #444;
+            margin-top: 30px;
+        }
+
+        p {
+            margin-bottom: 1.5rem;
+            text-align: justify;
+        }
+
+        .example-box {
+            background: #fff;
+            border: 1px solid #ddd;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+            display: flex;
+            justify-content: space-around;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        .example-item {
+            text-align: center;
+            flex: 1;
+            min-width: 200px;
+        }
+        
+        .bad-ocr {
+            font-family: monospace;
+            color: #c0392b;
+            background: #fae5e3;
+            padding: 10px;
+            border-radius: 4px;
+        }
+
+        .good-latex {
+            font-family: monospace;
+            color: #27ae60;
+            background: #eafaf1;
+            padding: 10px;
+            border-radius: 4px;
+        }
+
+        .pipeline-steps {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 30px 0;
+            text-align: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .step {
+            background: var(--section-bg);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #ddd;
+            flex: 1;
+            min-width: 140px;
+            font-weight: bold;
+            color: var(--secondary-color);
+        }
+
+        .arrow {
+            font-size: 1.5rem;
+            color: #999;
+        }
+
+        .table-container {
+            overflow-x: auto;
+            margin-bottom: 40px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            border-radius: 8px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.95rem;
+        }
+
+        th, td {
+            padding: 12px 15px;
+            text-align: center;
+            border-bottom: 1px solid #eee;
+        }
+
+        th {
+            background-color: var(--secondary-color);
+            color: #fff;
+            font-weight: 500;
+            text-transform: uppercase;
+            font-size: 0.85rem;
+            letter-spacing: 0.5px;
+        }
+
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+
+        tr:hover {
+            background-color: #f1f1f1;
+        }
+
+        .highlight {
+            font-weight: bold;
+            color: var(--primary-color);
+        }
+
+        footer {
+            text-align: center;
+            padding: 40px 20px;
+            background: #333;
+            color: #fff;
+            font-size: 0.9rem;
+            margin-top: 50px;
+        }
+        
+        @media (max-width: 768px) {
+            .pipeline-steps { flex-direction: column; }
+            .arrow { transform: rotate(90deg); margin: 5px 0; }
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <nav>
+            <a href="#" class="nav-brand">CS566 Group Project</a>
+            <div class="nav-links">
+                <a href="#motivation">Motivation</a>
+                <a href="#methodology">Methodology</a>
+                <a href="#results">Results</a>
+                <a href="#future">Future Work</a>
+            </div>
+        </nav>
+    </header>
+
+    <div class="project-hero">
+        <h1>LaTeX Equation OCR</h1>
+        <div class="subtitle">From Equation Images to Structured LaTeX</div>
+        
+        <div class="authors">
+            <span class="author-name">Yujie Ding</span>
+            <span class="author-name">Shi-Yuk Fong</span>
+            <span class="author-name">Heqi (Caitlyn) Yin</span>
+        </div>
+        <p style="margin-top: 20px; color: #666;">University of Wisconsin-Madison | Fall 2025</p>
+    </div>
+
+    <section id="motivation">
+        <h2 class="section-title">Motivation</h2>
+        <p>
+            [cite_start]Math is a visual language, but computers often see equation images merely as raw pixels[cite: 7]. [cite_start]Standard OCR tools fail on mathematical expressions because math is highly structured and 2D—relying heavily on subscripts, superscripts, fractions, matrices, and nested expressions[cite: 8].
+        </p>
+        <p>
+            [cite_start]This limitation creates bad real-world impressions for students and researchers and acts as a significant accessibility barrier for blind or low-vision users who rely on screen readers[cite: 9].
+        </p>
+
+        <div class="example-box">
+            <div class="example-item">
+                <h4>Input Image</h4>
+                <div style="font-size: 1.5rem; margin: 10px;">$\int_{-\infty}^{\infty} e^{-ax^2} dx$</div>
+            </div>
+            <div class="example-item">
+                <h4>Standard OCR (Fail)</h4>
+                <div class="bad-ocr">Z∞-∞e-ax2dx = rπa</div>
+            </div>
+            <div class="example-item">
+                <h4>Our Goal (LaTeX)</h4>
+                <div class="good-latex">\int_{-\infty}^{\infty} e^{-ax^2}dx</div>
+            </div>
+        </div>
+    </section>
+
+    <section id="methodology">
+        <h2 class="section-title">Methodology</h2>
+        <p>
+            [cite_start]Our system uses an image-to-sequence translation model trained on the <strong>IM2LaTeX-100K</strong> dataset (~100k equation images)[cite: 28]. The architecture consists of three main stages:
+        </p>
+
+        <div class="pipeline-steps">
+            <div class="step">Input Image<br><small>(Grayscale, Resized)</small></div>
+            <div class="arrow">&#8594;</div>
+            <div class="step">Encoder<br><small>(CNN or ResNet)</small></div>
+            <div class="arrow">&#8594;</div>
+            <div class="step">Embedding<br><small>(Feature Grid)</small></div>
+            <div class="arrow">&#8594;</div>
+            <div class="step">Decoder<br><small>(LSTM + Attention)</small></div>
+            <div class="arrow">&#8594;</div>
+            <div class="step">Output LaTeX<br><small>(Sequence)</small></div>
+        </div>
+
+        <h3>Key Components</h3>
+        <ul>
+            [cite_start]<li><strong>Encoder:</strong> We experimented with both a standard CNN and a ResNet-34 backbone to extract feature grids from the raw images[cite: 29].</li>
+            <li><strong>Decoder:</strong> We compared a standard LSTM against an <strong>Attention-based LSTM</strong>. [cite_start]The attention mechanism allows the decoder to "look at" specific regions of the image (e.g., the numerator of a fraction) while generating the corresponding token[cite: 30].</li>
+            [cite_start]<li><strong>Metrics:</strong> Performance was measured using BLEU-4, Exact Match (EM), and Normalized Edit Distance (NED)[cite: 37].</li>
+        </ul>
+    </section>
+
+    <section id="results">
+        <h2 class="section-title">Experimental Results</h2>
+        <p>
+            We conducted a comparative analysis between different Encoders (CNN vs. ResNet) and Decoders (Standard LSTM vs. Attention). [cite_start]The results clearly show that <strong>Attention dramatically improves structural accuracy</strong>[cite: 47].
+        </p>
+
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Encoder</th>
+                        <th>Decoder</th>
+                        <th>Test Loss <br><small>(Lower is better)</small></th>
+                        <th>BLEU-4 <br><small>(Higher is better)</small></th>
+                        <th>Exact Match (EM) <br><small>(Higher is better)</small></th>
+                        <th>NED <br><small>(Lower is better)</small></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>CNN</td>
+                        <td>LSTM</td>
+                        <td>3.5426</td>
+                        <td>0.3622</td>
+                        <td>0.0027</td>
+                        <td>0.5087</td>
+                    </tr>
+                    <tr>
+                        <td>ResNet</td>
+                        <td>LSTM</td>
+                        <td>3.9982</td>
+                        <td>0.4098</td>
+                        <td>0.0098</td>
+                        <td>0.4385</td>
+                    </tr>
+                    <tr>
+                        <td>CNN</td>
+                        <td>Attention</td>
+                        <td>3.7866</td>
+                        <td>0.6563</td>
+                        <td>0.1824</td>
+                        <td>0.1822</td>
+                    </tr>
+                    <tr style="background-color: #eafaf1;">
+                        <td><strong>ResNet</strong></td>
+                        <td><strong>Attention</strong></td>
+                        <td><strong>3.1955</strong></td>
+                        <td><strong class="highlight">0.7695</strong></td>
+                        <td><strong class="highlight">0.3055</strong></td>
+                        <td><strong class="highlight">0.1148</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        
+        <p>
+            <strong>Key Findings:</strong>
+            <ul>
+                <li>The <strong>ResNet + Attention</strong> combination performed best across all metrics.</li>
+                [cite_start]<li>The Exact Match (EM) score jumped from <1% (Baseline) to nearly <strong>31%</strong> with Attention, proving its necessity for handling complex 2D structures[cite: 41].</li>
+                [cite_start]<li>Visual attention helps the model align its focus, significantly reducing the Normalized Edit Distance (NED) to 0.1148[cite: 43].</li>
+            </ul>
+        </p>
+    </section>
+
+    <section id="future">
+        <h2 class="section-title">Discussion & Future Work</h2>
+        <p>
+            [cite_start]While the current model shows promise, training on ~100k examples revealed challenges with I/O bottlenecks and overfitting[cite: 48].
+        </p>
+        <h3>Next Steps</h3>
+        <ul>
+            [cite_start]<li><strong>Efficiency:</strong> We plan to store images as preprocessed tensors to speed up training and enable larger-scale experiments[cite: 52].</li>
+            <li><strong>Edge Deployment:</strong> The current model is relatively heavy. [cite_start]We aim to explore <strong>knowledge distillation</strong> and smaller backbones to allow the model to run on mobile or edge devices[cite: 51].</li>
+            [cite_start]<li><strong>Evaluation:</strong> We intend to incorporate visual checks alongside string metrics to better catch small structural errors that affect readability[cite: 49].</li>
+        </ul>
+    </section>
+
+    <footer>
+        &copy; 2025 CS566 Computer Vision Group. University of Wisconsin-Madison.
+    </footer>
+
+</body>
+</html>
