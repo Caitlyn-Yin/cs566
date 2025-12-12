@@ -63,6 +63,7 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
         dummy = torch.zeros(1, 1, IMG_HEIGHT, IMG_WIDTH).to(DEVICE)
         enc_out = encoder(dummy)
     encoder_dim = enc_out.shape[2]
+    encoder_feature_shape = getattr(encoder, "last_feature_shape", None)
     print(f"Encoder output dimension: {encoder_dim}")
 
     if decoder_type == "attention":
@@ -83,14 +84,17 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
             dropout_p=0
         ).to(DEVICE)
     elif decoder_type == "transformer":
-         decoder = TransformerDecoder(
+        decoder = TransformerDecoder(
             vocab_size=vocab_size,
             decoder_hidden_dim=256, 
             encoder_dim=encoder_dim,
             num_heads=8, # Matching main.py default
             num_layers=3, # Matching main.py default
             max_len=MAX_SEQ_LEN,
-            dropout_p=0
+            dropout_p=0,
+            use_2d_encoder_pos=True,
+            memory_height=encoder_feature_shape[0] if encoder_feature_shape else None,
+            memory_width=encoder_feature_shape[1] if encoder_feature_shape else None,
         ).to(DEVICE)
     else:
         raise ValueError(f"Unsupported decoder type: {decoder_type}")

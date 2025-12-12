@@ -87,6 +87,8 @@ def load_model(model_path):
     else:
         encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
         encoder_dim = 512 # CNNEncoder output dim from main.py
+
+
         
     # We need to know vocab size to initialize decoder. 
     # In a real scenario, we should save vocab/tokenizer with the model.
@@ -138,6 +140,15 @@ def load_model(model_path):
             dropout_p=0
         ).to(DEVICE)
     elif "transformer" in model_path.lower():
+        encoder_feature_shape = None
+        try:
+            img_height, img_width = get_image_size(encoder.__class__.__name__.lower())
+            with torch.no_grad():
+                dummy = torch.zeros(1, 1, img_height, img_width).to(DEVICE)
+                encoder(dummy)
+            encoder_feature_shape = getattr(encoder, "last_feature_shape", None)
+        except Exception as exc:
+            print(f"Warning: could not infer encoder feature shape for positional encoding ({exc}).")
         # Transformer Parameters
         NUM_HEADS = 8
         NUM_LAYERS = 3
@@ -150,7 +161,10 @@ def load_model(model_path):
             num_heads=NUM_HEADS,
             num_layers=NUM_LAYERS,
             max_len=MAX_SEQ_LEN,
-            dropout_p=0
+            dropout_p=0,
+            use_2d_encoder_pos=True,
+            memory_height=encoder_feature_shape[0] if encoder_feature_shape else None,
+            memory_width=encoder_feature_shape[1] if encoder_feature_shape else None,
         ).to(DEVICE)
         
 
@@ -184,9 +198,9 @@ def process_image(image_path, encoder_type):
     img_tensor = transform(img).unsqueeze(0).to(DEVICE) # Add batch dim
     return img_tensor
 
-def predict(model, image_tensor, tokenizer):
+def predict(model, image_tensor, tokenizer, beam_width=5):
     
-    decoded_indices = beam_search_decode(model, image_tensor, beam_width=5, max_len=MAX_SEQ_LEN)
+    decoded_indices = beam_search_decode(model, image_tensor, beam_width=beam_width, max_len=MAX_SEQ_LEN)
             
     # Convert indices to string
     latex_str = tokenizer.inverse_transform(decoded_indices[0])

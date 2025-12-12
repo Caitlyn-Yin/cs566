@@ -45,12 +45,10 @@ TEST_PT_PATH = os.path.join(DATA_DIR, 'test_processed.pt')
 
 # Model & Training Hyperparameters
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# BATCH_SIZE = 256
-BATCH_SIZE = 512
+BATCH_SIZE = 256
+# BATCH_SIZE = 512
 EPOCHS = 100
-# LEARNING_RATE = 1e-3
-DROPOUT = 0.3
-CLIP_GRAD = 5.0
+DROPOUT = 0.1
 LABEL_SMOOTHING = 0.1
 
 MAX_SEQ_LEN = 180
@@ -430,12 +428,12 @@ class CNNEncoder(nn.Module):
             nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1), # (B, 512, H/8, W/8)
             nn.BatchNorm2d(512),
             nn.ReLU(),
-            nn.MaxPool2d(2, 2),  # (B, 512, H/16, W/16)
+            nn.MaxPool2d(1, 1),  # (B, 512, H/8, W/8) - no downsample
 
-            nn.Conv2d(512, ENCODER_DIM, kernel_size=3, stride=1, padding=1), # (B, encoder_dim, H/16, W/16)
+            nn.Conv2d(512, ENCODER_DIM, kernel_size=3, stride=1, padding=1), # (B, encoder_dim, H/8, W/8)
             nn.BatchNorm2d(ENCODER_DIM),
             nn.ReLU(),
-            nn.MaxPool2d(2, 2)  # (B, encoder_dim, H/32, W/32)
+            nn.MaxPool2d(1, 1)  # (B, encoder_dim, H/8, W/8) - no downsample
         )
     
     def __repr__(self):
@@ -450,6 +448,7 @@ class CNNEncoder(nn.Module):
 
         # Permute and flatten: (B, 2048, H_enc, W_enc) -> (B, H_enc*W_enc, 2048)
         B, C, H_enc, W_enc = out.shape
+        self.last_feature_shape = (H_enc, W_enc)
         out = out.permute(0, 2, 3, 1) # (B, H_enc, W_enc, C)
         out = out.view(B, -1, C) # (B, num_pixels, encoder_dim)
         return out
@@ -461,19 +460,26 @@ class ResNetEncoder(nn.Module):
     """
     def __init__(self, encoded_image_size=16): # H/32 * W/32 = 3 * 16 = 48
         super(ResNetEncoder, self).__init__()
-        resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
+        resnet = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        # resnet = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
         # resnet = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
         # Remove the final fully connected and avgpool layers
         modules = list(resnet.children())[:-2]
         self.resnet = nn.Sequential(*modules)
         
+        # Remove downsampling from the last two ResNet blocks (layer3 and layer4)
+        # ResNet blocks downsample via stride=2 in the first conv of the block
+        # We'll modify layer3 and layer4 to use stride=1
+        for block in self.resnet[-2:]:  # layer3 and layer4
+            if hasattr(block[0], 'conv1'):
+                block[0].conv1.stride = (1, 1)
+            if hasattr(block[0], 'downsample') and block[0].downsample is not None:
+                block[0].downsample[0].stride = (1, 1)
+        
         # We need a 1-channel input (grayscale)
         # Modify the first conv layer
         self.resnet[0] = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
-        # Adaptive pooling to get a fixed-size feature map
-        self.adaptive_pool = nn.AdaptiveAvgPool2d((encoded_image_size, encoded_image_size))
-    
     def __repr__(self):
         return "ResNetEncoder"
     
@@ -482,10 +488,10 @@ class ResNetEncoder(nn.Module):
 
     def forward(self, images):
         # images: (B, 1, H, W)
-        out = self.resnet(images) # (B, 2048, H/32, W/32) e.g., (B, 2048, 3, 16)
-        # out = self.adaptive_pool(out) # (B, 2048, H_enc, W_enc)
-        
-        # Permute and flatten: (B, 2048, H_enc, W_enc) -> (B, H_enc*W_enc, 2048)
+        out = self.resnet(images) # (B, encoder_dim, H/32, W/32) e.g., (B, encoder_dim, 3, 16)
+        # out = self.adaptive_pool(out) # (B, encoder_dim, H_enc, W_enc)
+
+        # Permute and flatten: (B, encoder_dim, H_enc, W_enc) -> (B, H_enc*W_enc, encoder_dim)
         B, C, H_enc, W_enc = out.shape
         out = out.permute(0, 2, 3, 1) # (B, H_enc, W_enc, C)
         out = out.view(B, -1, C) # (B, num_pixels, encoder_dim)
@@ -530,7 +536,14 @@ class ViTEncoder(nn.Module):
         
         # Return sequence of patch embeddings (exclude class token)
         # Output shape: (B, num_patches, hidden_dim)
-        return x[:, 1:]
+        tokens = x[:, 1:]
+        num_tokens = tokens.size(1)
+        side = int(math.sqrt(num_tokens))
+        if side * side == num_tokens:
+            self.last_feature_shape = (side, side)
+        else:
+            self.last_feature_shape = (1, num_tokens)
+        return tokens
 
     def __repr__(self):
         return "ViTEncoder"
@@ -544,23 +557,29 @@ class Attention(nn.Module):
         super(Attention, self).__init__()
         self.W_enc = nn.Linear(encoder_dim, attention_dim)
         self.W_dec = nn.Linear(decoder_hidden_dim, attention_dim)
+        self.W_cov = nn.Linear(1, attention_dim)
         self.V = nn.Linear(attention_dim, 1)
         self.tanh = nn.Tanh()
         self.softmax = nn.Softmax(dim=1)
 
-    def forward(self, encoder_out, decoder_hidden):
+    def forward(self, encoder_out, decoder_hidden, coverage=None):
         # encoder_out: (B, num_pixels, encoder_dim)
         # decoder_hidden: (B, decoder_hidden_dim)
         
         proj_enc = self.W_enc(encoder_out) # (B, num_pixels, attention_dim)
         proj_dec = self.W_dec(decoder_hidden).unsqueeze(1) # (B, 1, attention_dim)
         
-        energy = self.V(self.tanh(proj_enc + proj_dec)).squeeze(2) # (B, num_pixels)
+        if coverage is None:
+            coverage = encoder_out.new_zeros(encoder_out.size(0), encoder_out.size(1))
+        proj_cov = self.W_cov(coverage.unsqueeze(2)) # (B, num_pixels, attention_dim)
+        
+        energy = self.V(self.tanh(proj_enc + proj_dec + proj_cov)).squeeze(2) # (B, num_pixels)
         alpha = self.softmax(energy) # (B, num_pixels)
         
         context = (encoder_out * alpha.unsqueeze(2)).sum(dim=1) # (B, encoder_dim)
         
         return context, alpha
+    
 
 class AttentionDecoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, decoder_hidden_dim, encoder_dim, attention_dim, dropout_p):
@@ -609,6 +628,7 @@ class AttentionDecoder(nn.Module):
         
         # Initialize hidden state
         h, c = self.init_hidden_state(encoder_out)
+        coverage = encoder_out.new_zeros(B, encoder_out.size(1))
         
         # First input is <sos> token
         input_token = targets[:, 0] # (B,)
@@ -619,7 +639,8 @@ class AttentionDecoder(nn.Module):
             embedded = self.embedding_dropout(embedded)
             
             # Get context vector from attention
-            context, alpha = self.attention(encoder_out, h)
+            context, alpha = self.attention(encoder_out, h, coverage)
+            coverage = coverage + alpha
             
             # Concatenate embedding and context
             lstm_input = torch.cat((embedded, context), dim=1)
@@ -761,11 +782,75 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:x.size(1), :].unsqueeze(0) #type: ignore
         return self.dropout(x)
     
+
+class PositionalEncoding2D(nn.Module):
+    def __init__(self, d_model, height, width, dropout=0.1):
+        super(PositionalEncoding2D, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        
+        if d_model % 2 != 0:
+            raise ValueError("Cannot use sin/cos positional encoding with odd dim (got dim={:d})".format(d_model))
+        
+        d_model_half = d_model // 2
+        
+        # 1. Create Y-axis (Height) Encoding
+        pe_h = torch.zeros(height, d_model_half)
+        pos_h = torch.arange(0, height).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model_half, 2) * -(math.log(10000.0) / d_model_half))
+        
+        pe_h[:, 0::2] = torch.sin(pos_h * div_term)
+        pe_h[:, 1::2] = torch.cos(pos_h * div_term)
+        
+        # 2. Create X-axis (Width) Encoding
+        pe_w = torch.zeros(width, d_model_half)
+        pos_w = torch.arange(0, width).unsqueeze(1)
+        pe_w[:, 0::2] = torch.sin(pos_w * div_term)
+        pe_w[:, 1::2] = torch.cos(pos_w * div_term)
+        
+        # 3. Broadcast to create (H, W, D)
+        # pe_h: (H, D/2) -> (H, 1, D/2) -> (H, W, D/2)
+        pe_h = pe_h.unsqueeze(1).repeat(1, width, 1)
+        
+        # pe_w: (W, D/2) -> (1, W, D/2) -> (H, W, D/2)
+        pe_w = pe_w.unsqueeze(0).repeat(height, 1, 1)
+        
+        # Concatenate to get full (H, W, D)
+        pe = torch.cat([pe_h, pe_w], dim=2)
+        
+        # Flatten to match the encoder output shape: (H*W, D)
+        pe = pe.view(-1, d_model)
+        
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (B, H*W, D)
+        # Add PE to the input
+        # Note: We assume x is already flattened in the spatial dimensions
+        x = x + self.pe.unsqueeze(0)
+        return self.dropout(x)
+
 class TransformerDecoder(nn.Module):
-    def __init__(self, vocab_size, decoder_hidden_dim, encoder_dim, num_heads=8, num_layers=4, max_len=512, dropout_p=0.1):
+    def __init__(
+        self,
+        vocab_size,
+        decoder_hidden_dim,
+        encoder_dim,
+        num_heads=8,
+        num_layers=4,
+        max_len=512,
+        dropout_p=0.1,
+        use_2d_encoder_pos=False,
+        memory_height=None,
+        memory_width=None,
+    ):
         super(TransformerDecoder, self).__init__()
         self.vocab_size = vocab_size
         self.decoder_hidden_dim = decoder_hidden_dim
+        self.use_2d_encoder_pos = use_2d_encoder_pos
+        self.memory_height = memory_height
+        self.memory_width = memory_width
+        self._memory_pos_dropout = dropout_p
+        self.memory_pos_encoder = None
         
         # 1. Project Encoder Output if dimensions differ
         self.encoder_proj = nn.Linear(encoder_dim, decoder_hidden_dim)
@@ -788,6 +873,31 @@ class TransformerDecoder(nn.Module):
         # 4. Final Head
         self.fc_out = nn.Linear(decoder_hidden_dim, vocab_size)
 
+    def _maybe_init_memory_pos(self, seq_len, device):
+        if not self.use_2d_encoder_pos:
+            return None
+
+        recreate = False
+        if self.memory_height is None or self.memory_width is None or self.memory_height * self.memory_width != seq_len:
+            recreate = True
+            height = int(math.sqrt(seq_len))
+            width = seq_len // height if height > 0 else seq_len
+            if height * width != seq_len:
+                # Fallback to 1 x seq_len grid if perfect factorization fails
+                height, width = 1, seq_len
+            self.memory_height, self.memory_width = height, width
+        if recreate or self.memory_pos_encoder is None:
+            self.memory_pos_encoder = PositionalEncoding2D(
+                self.decoder_hidden_dim,
+                self.memory_height,
+                self.memory_width,
+                dropout=self._memory_pos_dropout,
+            ).to(device)
+        # Ensure module matches parent training mode
+        self.memory_pos_encoder.train(self.training)
+
+        return self.memory_pos_encoder
+
     def generate_square_subsequent_mask(self, sz, device):
         """Generates a triangular mask to prevent attending to future tokens."""
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
@@ -805,6 +915,9 @@ class TransformerDecoder(nn.Module):
         #     seq_len = self.pos_encoder.pe.size(0) #type: ignore
         #     targets = targets[:, :seq_len]
         memory = self.encoder_proj(encoder_out) # (B, num_pixels, decoder_hidden_dim)
+        memory_pos_encoder = self._maybe_init_memory_pos(memory.size(1), memory.device)
+        if memory_pos_encoder is not None:
+            memory = memory_pos_encoder(memory)
 
         # --- TRAINING MODE (Fast Parallel with Shifted Inputs) ---
         if teacher_forcing_ratio == 1.0:
@@ -911,11 +1024,6 @@ class Im2LatexModel(nn.Module):
     #         self.encoder.eval()
         
     #     print(f"Encoder trainable set to {trainable}.")
-SYNONYMS = {
-
-}
-
-
 
 # --- Training and Evaluation Loops ---
 
@@ -938,7 +1046,7 @@ def beam_search_decode(mdl, images, beam_width=5, max_len=150):
         model = mdl.module if isinstance(mdl, nn.DataParallel) else mdl
 
         B = images.size(0)
-        if beam_width == 1:
+        if beam_width == 0:
             # Create a zero target tensor with <sos> token
             zero_target = torch.full((B, max_len), PAD_TOKEN, device=DEVICE).long()
             zero_target[:, 0] = SOS_TOKEN  # Set the first token to <sos>
@@ -951,7 +1059,7 @@ def beam_search_decode(mdl, images, beam_width=5, max_len=150):
             # Convert to list of lists
             return preds_idx.tolist()
         
-        # 1. Encode images
+        # Encode images
         # encoder_out: (B, num_pixels, encoder_dim)
         encoder_out = model.encoder(images)
         vocab_size = model.decoder.vocab_size
@@ -961,7 +1069,8 @@ def beam_search_decode(mdl, images, beam_width=5, max_len=150):
         # --- Initialize Decoder State (Batch Size B) ---
         if isinstance(model.decoder, AttentionDecoder):
             h, c = model.decoder.init_hidden_state(encoder_out)
-            state = (h, c)
+            coverage = encoder_out.new_zeros(B, encoder_out.size(1))
+            state = (h, c, coverage)
         elif isinstance(model.decoder, LSTMDecoder):
             h, c = model.decoder.init_hidden_state(encoder_out)
             state = (h, c)
@@ -977,14 +1086,15 @@ def beam_search_decode(mdl, images, beam_width=5, max_len=150):
         start_token = torch.tensor([SOS_TOKEN] * B, device=DEVICE).long() # (B,)
         
         if isinstance(model.decoder, AttentionDecoder):
-            h, c = state
+            h, c, coverage = state
             emb = model.decoder.embedding(start_token) # (B, emb_dim)
-            context, alpha = model.decoder.attention(encoder_out, h)
+            context, alpha = model.decoder.attention(encoder_out, h, coverage)
+            coverage = coverage + alpha
             lstm_in = torch.cat((emb, context), dim=1)
             h_new, c_new = model.decoder.lstm_cell(lstm_in, (h, c))
             out = model.decoder.fc_out(h_new)
             log_probs = F.log_softmax(out, dim=1) # (B, V)
-            state = (h_new, c_new)
+            state = (h_new, c_new, coverage)
             
         elif isinstance(model.decoder, LSTMDecoder):
             h, c = state
@@ -1022,15 +1132,15 @@ def beam_search_decode(mdl, images, beam_width=5, max_len=150):
         encoder_out = encoder_out.unsqueeze(1).expand(B, beam_width, *encoder_out.shape[1:]).reshape(B * beam_width, *encoder_out.shape[1:])
         
         # Expand State
-        if isinstance(state, tuple): # RNN
-            h, c = state
-            h = h.unsqueeze(1).expand(B, beam_width, -1).reshape(B * beam_width, -1)
-            c = c.unsqueeze(1).expand(B, beam_width, -1).reshape(B * beam_width, -1)
-            state = (h, c)
+        if isinstance(state, tuple): # RNN-based decoders
+            expanded = []
+            for comp in state:
+                expanded_comp = comp.unsqueeze(1).expand(B, beam_width, *comp.shape[1:]).reshape(B * beam_width, *comp.shape[1:])
+                expanded.append(expanded_comp)
+            state = tuple(expanded)
         else: # Transformer Memory
             state = state.unsqueeze(1).expand(B, beam_width, *state.shape[1:]).reshape(B * beam_width, *state.shape[1:])
             
-        # --- Loop ---
         for step in range(1, max_len):
             # Input is the last token of each beam
             last_tokens = seqs[:, -1] # (B*k,)
@@ -1040,17 +1150,22 @@ def beam_search_decode(mdl, images, beam_width=5, max_len=150):
             
             # If all beams are finished, we could stop, but some might be unfinished.
             # We continue until max_len.
+            if isinstance(state, tuple):
+                prev_state = tuple(comp.clone() for comp in state)
+            else:
+                prev_state = state.clone()
             
             # --- Decoder Step (Batch Size B*k) ---
             if isinstance(model.decoder, AttentionDecoder):
-                h, c = state
+                h, c, coverage = state
                 emb = model.decoder.embedding(last_tokens)
-                context, alpha = model.decoder.attention(encoder_out, h)
+                context, alpha = model.decoder.attention(encoder_out, h, coverage)
+                coverage_new = coverage + alpha
                 lstm_in = torch.cat((emb, context), dim=1)
                 h_new, c_new = model.decoder.lstm_cell(lstm_in, (h, c))
                 out = model.decoder.fc_out(h_new)
                 log_probs = F.log_softmax(out, dim=1)
-                state_new = (h_new, c_new)
+                state_new = (h_new, c_new, coverage_new)
                 
             elif isinstance(model.decoder, LSTMDecoder):
                 h, c = state
@@ -1080,6 +1195,21 @@ def beam_search_decode(mdl, images, beam_width=5, max_len=150):
             if is_finished.any():
                 log_probs[is_finished, :] = -float('inf')
                 log_probs[is_finished, EOS_TOKEN] = 0.0
+                if isinstance(model.decoder, AttentionDecoder):
+                    h_prev, c_prev, cov_prev = prev_state
+                    h_new, c_new, cov_new = state_new
+                    mask = is_finished.unsqueeze(1)
+                    h_new = torch.where(mask, h_prev, h_new)
+                    c_new = torch.where(mask, c_prev, c_new)
+                    cov_new = torch.where(mask, cov_prev, cov_new)
+                    state_new = (h_new, c_new, cov_new)
+                elif isinstance(model.decoder, LSTMDecoder):
+                    h_prev, c_prev = prev_state
+                    h_new, c_new = state_new
+                    mask = is_finished.unsqueeze(1)
+                    h_new = torch.where(mask, h_prev, h_new)
+                    c_new = torch.where(mask, c_prev, c_new)
+                    state_new = (h_new, c_new)
             
             # --- Calculate Scores ---
             # beam_scores: (B*k,)
@@ -1108,10 +1238,10 @@ def beam_search_decode(mdl, images, beam_width=5, max_len=150):
             
             # Update State
             if isinstance(state_new, tuple):
-                h, c = state_new
-                h = h[gather_indices]
-                c = c[gather_indices]
-                state = (h, c)
+                gathered = []
+                for comp in state_new:
+                    gathered.append(comp[gather_indices])
+                state = tuple(gathered)
             else:
                 state = state_new[gather_indices]
                 
@@ -1174,10 +1304,7 @@ def train_one_epoch(model, loader, optimizer, criterion, clip, teacher_forcing_r
         
         epoch_loss += loss.item()
         # pbar.set_description(f"Training Loss: {loss.item():.4f}")
-    
-        
     return epoch_loss / len(loader)
-
 
 def evaluate(model, loader, criterion, tokenizer, beamer_width=1):
     model.eval()
@@ -1224,8 +1351,6 @@ def evaluate(model, loader, criterion, tokenizer, beamer_width=1):
                 if pred_str == true_str:
                     exact_match_count += 1
                 
-
-                    
     # Calculate metrics
     val_loss = epoch_loss / len(loader)
     bleu_score = corpus_bleu(references, hypotheses)
@@ -1253,8 +1378,9 @@ def evaluate(model, loader, criterion, tokenizer, beamer_width=1):
 
 def get_teacher_forcing_ratio(epoch, max_tfr, min_tfr, total_epochs):
     """Linearly decays teacher forcing ratio from max_tfr to min_tfr over total_epochs."""
-    # Warmup for first 5% of epochs
-    if epoch < int(0.05 * total_epochs):
+    # Warmup for first 1% of epochs
+    if epoch < int(0.01 * total_epochs):
+    # if epoch < int(0.05 * total_epochs):
         return max_tfr
     
     # Linear decay until 80% of epochs
@@ -1267,7 +1393,8 @@ def get_teacher_forcing_ratio(epoch, max_tfr, min_tfr, total_epochs):
     return min_tfr
 
 def get_image_size(encoder_type, decoder_type=None):
-    if encoder_type in ["vit_encoder", "vitencoder"]:
+    normalized = encoder_type.lower()
+    if normalized in ["vit_encoder", "vitencoder", "vit"]:
         return (224, 224)
     else:
         return (96, 512)
@@ -1306,22 +1433,24 @@ def main(encoder_type, decoder_type, resume=False):
         MAX_TEACHER_FORCING_RATIO = 1.0
         MIN_TEACHER_FORCING_RATIO = 1.0
         WEIGHT_DECAY = 1e-4
+        CLIP_GRAD = 1.0
     else:
-        MAX_TEACHER_FORCING_RATIO = 1.0
+        MAX_TEACHER_FORCING_RATIO = 0.8
         MIN_TEACHER_FORCING_RATIO = 0.3
         WEIGHT_DECAY = 1e-4
+        CLIP_GRAD = 5.0
 
-    
     image_transform = transforms.Compose([
+        ResizeAndPad((IMG_HEIGHT, IMG_WIDTH)),
         transforms.RandomApply([
         transforms.RandomAffine(
-            degrees=1,              # Rotate between -1 and +1 degrees
-            translate=(0.01, 0.01), # Shift vertically/horizontally by max 1%
-            scale=(0.95, 1.05),     # Zoom between 95% and 105%
-            shear=1                 # Shear (slant) by max 1 degree
+            degrees=2,              # Rotate between -2 and +2 degrees
+            translate=(0.01, 0.01), # Shift vertically/horizontally by 1% of the image size
+            scale=(0.95, 1.01),     # Zoom between 95% and 101%
+            shear=1,                # Shear (slant) by max 1 degree
+            fill=255                # Fill with white color
         )
         ], p=0.5),
-        ResizeAndPad((IMG_HEIGHT, IMG_WIDTH)),
         transforms.ToTensor(), # Converts to [0, 1] and (C, H, W)
         transforms.Normalize((0.5,), (0.5,)) # Normalize to [-1, 1]
     ])
@@ -1422,6 +1551,7 @@ def main(encoder_type, decoder_type, resume=False):
         dummy = torch.zeros(1, 1, IMG_HEIGHT, IMG_WIDTH).to(DEVICE)
         enc_out = encoder(dummy)
     detected_encoder_dim = enc_out.shape[2]
+    encoder_feature_shape = getattr(encoder, "last_feature_shape", None)
     print(f"Detected encoder output dimension: {detected_encoder_dim}")
 
     if decoder_type == "attention_decoder":
@@ -1464,7 +1594,10 @@ def main(encoder_type, decoder_type, resume=False):
             num_heads=NUM_HEADS,
             num_layers=NUM_LAYERS,
             max_len=MAX_SEQ_LEN,
-            dropout_p=0.1
+            dropout_p=0.1,
+            use_2d_encoder_pos=True,
+            memory_height=encoder_feature_shape[0] if encoder_feature_shape else None,
+            memory_width=encoder_feature_shape[1] if encoder_feature_shape else None,
         ).to(DEVICE)
         if resume:
             decoder_lr = 5e-5
@@ -1473,7 +1606,7 @@ def main(encoder_type, decoder_type, resume=False):
     else:
         raise ValueError("Unsupported decoder type")
 
-    postfix = f"_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}"
+    postfix = f""
 
     model = Im2LatexModel(encoder, decoder, resume, postfix=postfix).to(DEVICE)
 
@@ -1638,7 +1771,7 @@ def main(encoder_type, decoder_type, resume=False):
         "test": test_record
     }
     model_name = model.module if isinstance(model, nn.DataParallel) else model
-    with open(f"{model_name}_records_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.json", "w") as f:
+    with open(f"{model_name}_records{postfix}.json", "w") as f:
         json.dump(records, f, indent=4)
     
 if __name__ == "__main__":
@@ -1652,4 +1785,4 @@ if __name__ == "__main__":
         # main("cnn_encoder", "attention_decoder", resume=True)
         # main("vit_encoder", "attention_decoder", resume=True)
         # main("vit_encoder", "lstm_decoder", resume=True)
-        main("resnet_encoder", "transformer_decoder", resume=False)
+        main("resnet_encoder", "transformer_decoder", resume=True)
