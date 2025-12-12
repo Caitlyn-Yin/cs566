@@ -287,38 +287,7 @@
         </div>
     </section>
 
-    <section id="methodology">
-        <h2 class="section-title">Methodology</h2>
-        <p>
-            Our system uses an image-to-sequence encoder-decoder translation model trained on the <strong>IM2LaTeX-100K</strong> dataset (~100k equation images). The architecture consists of three main stages:
-        </p>
-
-        <div style="display: flex; justify-content: center; overflow-x: visible; margin: 30px 0;">
-            <div class="pipeline-steps" style="flex-wrap: nowrap; min-width: max-content;">
-            <div class="step" style="padding: 8px 0px;">Input Image<br><small style="font-size: 0.7rem;">(Grayscale, Resized)</small></div>
-            <div class="arrow">&#8594;</div>
-            <div class="step" style="padding: 8px 0px;">Encoder<br><small style="font-size: 0.7rem;">(CNN or ResNet)</small></div>
-            <div class="arrow">&#8594;</div>
-            <div class="step" style="padding: 8px 0px;">Embedding<br><small style="font-size: 0.7rem;">(Feature Vector)</small></div>
-            <div class="arrow">&#8594;</div>
-            <div class="step" style="padding: 8px 0px;">Decoder<br><small style="font-size: 0.7rem;">(LSTM + Attention)</small></div>
-            <div class="arrow">&#8594;</div>
-            <div class="step" style="padding: 8px 0px;">Output LaTeX<br><small style="font-size: 0.7rem;">(Sequence)</small></div>
-            </div>
-        </div>
-
-        <h3>Key Components</h3>
-        <ul>
-            <li><strong>Encoder:</strong> We experimented with a standard CNN, a ResNet-34 backbone and a Vision Transformer (ViT) base backbone to extract feature grids from the raw images.</li>
-            <li><strong>Decoder:</strong> We compared a standard LSTM against an <strong>Attention-based LSTM</strong>. The attention mechanism allows the decoder to "look at" specific regions of the image (e.g., the numerator of a fraction) while generating the corresponding token.</li>
-            <li><strong>Metrics:</strong> Performance was measured using BLEU-4, Exact Match (EM), and Normalized Edit Distance (NED).</li>
-        </ul>
-        <p>
-            The full source code for this project is available on GitHub: 
-            <a href="https://github.com/Caitlyn-Yin/cs566" target="_blank" style="color: var(--primary-color); text-decoration: underline;">https://github.com/Caitlyn-Yin/cs566</a>
-        </p>
-    </section>
-
+    
     <section id="demo">
         <h2 class="section-title">Live Demo</h2>
         <p>
@@ -359,11 +328,67 @@
         </div>
     </section>
 
+    <section id="methodology">
+        <h2 class="section-title">Methodology</h2>
+        <p>
+            Our system uses an image-to-sequence encoder-decoder translation model trained on the <strong>IM2LaTeX-100K</strong> dataset (~100k equation images). The architecture consists of three main stages:
+        </p>
+
+        <div style="display: flex; justify-content: center; overflow-x: visible; margin: 30px 0;">
+            <div class="pipeline-steps" style="flex-wrap: nowrap; min-width: max-content;">
+            <div class="step" style="padding: 8px 0px;">Input Image<br><small style="font-size: 0.7rem;">(Grayscale, Resized)</small></div>
+            <div class="arrow">&#8594;</div>
+            <div class="step" style="padding: 8px 0px;">Encoder<br><small style="font-size: 0.7rem;">(CNN or ResNet)</small></div>
+            <div class="arrow">&#8594;</div>
+            <div class="step" style="padding: 8px 0px;">Embedding<br><small style="font-size: 0.7rem;">(Feature Vector)</small></div>
+            <div class="arrow">&#8594;</div>
+            <div class="step" style="padding: 8px 0px;">Decoder<br><small style="font-size: 0.7rem;">(LSTM + Attention)</small></div>
+            <div class="arrow">&#8594;</div>
+            <div class="step" style="padding: 8px 0px;">Output LaTeX<br><small style="font-size: 0.7rem;">(Sequence)</small></div>
+            </div>
+        </div>
+
+        <h3>Key Components</h3>
+        <ul>
+            <li><strong>Encoder:</strong> We experimented with a standard CNN, a ResNet-34 backbone and a Vision Transformer (ViT) base backbone to extract feature grids from the raw images.</li>
+            <li><strong>Decoder:</strong> We compared a standard LSTM against an <strong>Attention-based LSTM</strong>. The attention mechanism allows the decoder to "look at" specific regions of the image (e.g., the numerator of a fraction) while generating the corresponding token.</li>
+            <li><strong>Metrics:</strong> Performance was measured using BLEU-4, Exact Match (EM), and Normalized Edit Distance (NED).</li>
+        </ul>
+        <h3>Training Strategy & Optimization</h3>
+        <p>
+            To ensure convergence and training efficiency on the Im2Latex dataset, we implemented several optimization techniques and architectural decisions:
+        </p>
+        <ul>
+            <li>
+                <strong>Efficient Data Preprocessing:</strong>
+                To address the significant I/O bottleneck caused by reading thousands of individual image files during training, we implemented an offline preprocessing pipeline. This step converts raw images and LaTeX tokens into pre-computed PyTorch tensors, which are serialized and saved to single <code>.pt</code> files. Loading the entire dataset into memory from these binary files resulted in a <strong>~10x increase in training speed</strong> compared to lazy loading from disk.
+            </li>
+            <li>
+                <strong>Optimization & Regularization:</strong> 
+                The model is optimized using <strong>Adam</strong> combined with <strong>Weight Decay</strong> to penalize overly complex weights. We heavily utilize <strong>Dropout</strong> within the decoder layers and embedding projections to prevent the model from memorizing the training set. Furthermore, <strong>Gradient Clipping</strong> is applied during backpropagation to prevent the "exploding gradient" problem, which is particularly common in RNN-based architectures.
+            </li>
+            <li>
+                <strong>Learning Rate Scheduling:</strong> 
+                We employ a <strong>ReduceLROnPlateau</strong> scheduler that actively monitors validation metrics (\(\text{BLEU} + \text{EM} - \text{NED}\)). When the model's performance plateaus for a defined patience window, the learning rate is automatically decayed. This allows the model to make large updates early in training while fine-tuning its weights with smaller steps in later epochs.
+            </li>
+            <li>
+                <strong>Teacher Forcing:</strong> 
+                To stabilize sequence generation training, we utilize Teacher Forcing, where the model is fed the ground-truth token from the previous time step rather than its own prediction. For LSTM-based decoders, we implemented a <strong>scheduled annealing strategy</strong>, starting with high teacher forcing and gradually reducing it to force the model to rely on its own predictions, thereby reducing exposure bias.
+            </li>
+            <li>
+                <strong>Stabilization Techniques:</strong> 
+                We incorporate <strong>Label Smoothing</strong> into the Cross-Entropy loss function, which prevents the model from becoming overconfident in its predictions and aids generalization. Additionally, <strong>Early Stopping</strong> is used to terminate training automatically if the validation loss fails to improve after a set number of epochs, saving computational resources and preventing overfitting.
+            </li>
+        </ul>
+    </section>
+
     <section id="results">
         <h2 class="section-title">Experimental Results</h2>
         <p>
             We conducted a comparative analysis between different Encoders (CNN, ResNet, ViT) and Decoders (LSTM with/without Attention). 
             We use 2 NVIDIA L40S (48 GB) GPUs for training and inference.
+            The full source code for this project is available on GitHub: 
+            <a href="https://github.com/Caitlyn-Yin/cs566" target="_blank" style="color: var(--primary-color); text-decoration: underline;">https://github.com/Caitlyn-Yin/cs566</a>
             The results clearly show that <strong>Attention dramatically improves structural accuracy</strong>.
         </p>
 
