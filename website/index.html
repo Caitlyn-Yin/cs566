@@ -290,7 +290,7 @@
     <section id="methodology">
         <h2 class="section-title">Methodology</h2>
         <p>
-            Our system uses an image-to-sequence translation model trained on the <strong>IM2LaTeX-100K</strong> dataset (~100k equation images). The architecture consists of three main stages:
+            Our system uses an image-to-sequence encoder-decoder translation model trained on the <strong>IM2LaTeX-100K</strong> dataset (~100k equation images). The architecture consists of three main stages:
         </p>
 
         <div style="display: flex; justify-content: center; overflow-x: visible; margin: 30px 0;">
@@ -362,8 +362,9 @@
     <section id="results">
         <h2 class="section-title">Experimental Results</h2>
         <p>
-            We conducted a comparative analysis between different Encoders (CNN, ResNet, ViT) and Decoders (LSTM with/without Attention). The results clearly show that <strong>Attention dramatically improves structural accuracy</strong>.
-
+            We conducted a comparative analysis between different Encoders (CNN, ResNet, ViT) and Decoders (LSTM with/without Attention). 
+            We use 2 NVIDIA L40S (48 GB) GPUs for training and inference.
+            The results clearly show that <strong>Attention dramatically improves structural accuracy</strong>.
         </p>
 
         <div class="table-container">
@@ -436,9 +437,10 @@
             <strong>Key Findings:</strong>
             <ul>
                 <li>The <strong>ResNet + Attention</strong> combination performed best across all metrics.</li>
-                <li>The Exact Match (EM) score jumped from <1% (Baseline) to nearly <strong>41%</strong> with Attention, proving its necessity for handling complex 2D structures.</li>
+                <li>Among the decoders, the ResNet backbone consistently outperformed others due to its ability to capture hierarchical features and spatial relationships effectively. This makes it particularly well-suited for the complex 2D structures inherent in mathematical equations.</li>
+                <li>Interestingly, <strong>ViT</strong> backbone did not outperform the ResNet backbone. ViT underperformed due to its fixed $224 \times 224$ input requirement, necessitating excessive padding that reduced resolution for rectangular text lines. Furthermore, processing images as patch sequences compromised the fine-grained spatial recognition essential for interpreting mathematical layout structure. </li>  
+                <li>For ResNet decoder, The Exact Match (EM) score jumped from <5% (LSTM Decoder without Attention) to over <strong>41%</strong> with Attention, proving its necessity for handling complex 2D structures.</li>
                 <li>Visual attention helps the model align its focus, significantly reducing the Normalized Edit Distance (NED) to 0.0977.</li>
-                <li>Interestingly, the <strong>ViT</strong> did not outperform the ResNet backbone. ViT underperformed due to its fixed \(224 \times 224\) input requirement, necessitating excessive padding that reduced resolution for rectangular text lines. Furthermore, processing images as patch sequences compromised the fine-grained spatial recognition essential for interpreting mathematical layout structure. </li>  
             </ul>
         </p>
     </section>
