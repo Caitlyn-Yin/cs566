@@ -99,21 +99,26 @@ def normalize_latex_old(formula):
     formula = re.sub(r'(<space>\s*)+', ' <space> ', formula)
     # replace multiple spaces with a single space
     formula = re.sub(r'\s+', ' ', formula).strip()
-    assert "vspace" not in formula, "vspace found in formula after normalization"
+    assert "vspace" not in formula, f"vspace found in formula after normalization: {formula}"
     return formula
 
 
 def normalize_latex(formula):
+    fmla = formula
     if not isinstance(formula, str):
         return ""
     # replace two or more instances of "\," separated by some space  (example, \, \,  or \,  \, \,)with a space token <space>
     formula = re.sub(r'(\\,(\s*\\,)+)', ' <space> ', formula)
     # remove thin spaces \, and negative thin spaces \! only
     formula = re.sub(r'(\\[,!])', '', formula)
+    # remove ule {} {}
+    formula = re.sub(r'ule\s*\{[^}]*\}\s*\{[^}]*\}', '', formula)
+    # remove \raisebox {}
+    formula = re.sub(r'\\raisebox\s*\{[^}]*\}', '', formula)
     # replace each instance of ~ \: \; \[space] \enspace \quad \qquad with a space token <space>
-    formula = re.sub(r'(~|\\:|\\;|\\ |\\enspace|\\quad|\\qquad)', ' <space> ', formula)
+    formula = re.sub(r'(~|\\:|\\;|\\ |\\enspace|\\quad|\\qquad|\\space|\\hfill|\\hfil(?![a-zA-Z]))', ' <space> ', formula)
     # replace \hspace { some text } \vspace { some text } with a space token <space>
-    formula = re.sub(r'(\\hspace\s*{[^}]*}|\\vspace\s*{[^}]*})', ' <space> ', formula)
+    formula = re.sub(r'(\\hspace\s*\*?\s*\{[^\}]*\}|\\vspace\s*\*?\s*\{[^\}]*\})', ' <space> ', formula)
     # replace multiple instances of <space> separated by some space with a single <space>
     formula = re.sub(r'(<space>\s*)+', ' <space> ', formula)
     # replace \left< and right> with \langle and \rangle
@@ -129,15 +134,15 @@ def normalize_latex(formula):
     # replace \left. and \right. with nothing
     formula = re.sub(r'\\left\.|\\right\.', '', formula)
     # replace \left and \right with nothing
-    formula = re.sub(r'\\left|\\right', '', formula)
+    formula = re.sub(r'\\left(?![a-zA-Z])|\\right(?![a-zA-Z])', '', formula)
     # replace \[bB]ig[g][lr] to nothing
-    formula = re.sub(r'\\[bB]igg?[lr]?(?![a-zA-Z])', '', formula)
+    formula = re.sub(r'\\[bB]igg?[lrm]?(?![a-zA-Z])', '', formula)
     # replace \to with \rightarrow
-    formula = re.sub(r'\\to', r'\\rightarrow', formula)
+    formula = re.sub(r'\\to(?![a-zA-Z])', r'\\rightarrow', formula)
     # replace \ne, \le, \ge with \neq, \leq, \geq
-    formula = re.sub(r'\\ne', r'\\neq', formula)
-    formula = re.sub(r'\\le', r'\\leq', formula)
-    formula = re.sub(r'\\ge', r'\\geq', formula)
+    formula = re.sub(r'\\ne(?![a-zA-Z])', r'\\neq', formula)
+    formula = re.sub(r'\\le(?![a-zA-Z])', r'\\leq', formula)
+    formula = re.sub(r'\\ge(?![a-zA-Z])', r'\\geq', formula)
     # replace \slash with /
     formula = re.sub(r'\\slash', r'/', formula)
     # replace \mathbf and \textbf with \bf;same for \it, \sf, \tt, \rm
@@ -150,7 +155,7 @@ def normalize_latex(formula):
     formula = re.sub(r'\\triangle(?![a-zA-Z])', r'\\bigtriangleup', formula)
     # replace multiple spaces with a single space
     formula = re.sub(r'\s+', ' ', formula).strip()
-    assert "vspace" not in formula, "vspace found in formula after normalization"
+    assert "vspace" not in formula, f"vspace found in formula after normalization: \nbefore: {fmla}\nafter: {formula}"
     return formula
 
 def load_data(csv_path, img_dir):
@@ -229,12 +234,12 @@ def get_data_loaders(
         collate_fn=collate_fn
     )
 
-    # return None, None, test_loader
+    # return None, None, 
     return train_loader, val_loader, test_loader
 
 class Tokenizer:
     """Builds a vocabulary and handles token-to-index mapping."""
-    def __init__(self, min_freq=5):
+    def __init__(self, min_freq=10):
         self.word2idx = {"<pad>": PAD_TOKEN, "<sos>": SOS_TOKEN, "<eos>": EOS_TOKEN, "<unk>": UNK_TOKEN}
         self.idx2word = {v: k for k, v in self.word2idx.items()}
         self.min_freq = min_freq
@@ -373,10 +378,6 @@ class PreprocessedIm2LatexDataset(Dataset):
 
     def __getitem__(self, idx):
         # Data is already a tuple of (image_tensor, formula_tensor)
-        # image, formula = self.data[idx]
-        # if len(formula) > MAX_SEQ_LEN:
-        #     formula = torch.cat([formula[:MAX_SEQ_LEN-1], formula[-1:]])
-        # return image, formula
         return self.data[idx]
 
 class CollateFn:
@@ -915,38 +916,6 @@ SYNONYMS = {
 }
 
 
-# def compute_synonym_loss(logits, targets, criterion, synonym_map, vocab_size):
-#     """
-#     logits: (Batch * Seq, VocabSize) - The raw model outputs
-#     targets: (Batch * Seq) - The ground truth indices
-#     """
-#     # 1. Start with hard one-hot targets
-#     # If target is index 5, this vector is [0, 0, 0, 0, 0, 1.0, 0, ...]
-#     target_probs = F.one_hot(targets, num_classes=vocab_size).float()
-    
-#     # 2. Soften the targets for synonyms
-#     for original_idx, synonym_idx in synonym_map.items():
-#         # Find all positions where the ground truth is the 'original' token
-#         mask = (targets == original_idx)
-        
-#         if mask.any():
-#             # Instead of 100% confidence on the original token, split it.
-#             # You can tune this ratio (e.g., 0.5/0.5 or 0.8/0.2)
-#             target_probs[mask, original_idx] = 0.5
-#             target_probs[mask, synonym_idx]  = 0.5
-
-#     # 3. Apply standard Label Smoothing (Optional but recommended)
-#     # If you want global smoothing (e.g., 0.1) on top of synonym splitting:
-#     # This ensures even non-synonyms don't get 100% probability.
-#     smoothing = 0.1
-#     # distribute 0.1 uniformly across all tokens
-#     target_probs = target_probs * (1 - smoothing) + (smoothing / vocab_size)
-
-#     # 4. Calculate Cross Entropy
-#     # Important: When passing probabilities (soft labels) to CrossEntropyLoss,
-#     # the input logits must be raw (not softmaxed), and the target must be the probability matrix.
-#     # Note: This requires PyTorch 1.10+
-#     return criterion(logits, target_probs)
 
 # --- Training and Evaluation Loops ---
 
@@ -1210,7 +1179,6 @@ def train_one_epoch(model, loader, optimizer, criterion, clip, teacher_forcing_r
     return epoch_loss / len(loader)
 
 
-
 def evaluate(model, loader, criterion, tokenizer, beamer_width=1):
     model.eval()
     epoch_loss = 0
@@ -1256,11 +1224,7 @@ def evaluate(model, loader, criterion, tokenizer, beamer_width=1):
                 if pred_str == true_str:
                     exact_match_count += 1
                 
-                # if i % 100 == 0:
-                #     with open("debug_predictions.txt", "a") as f:
-                #         # print the whole matrix, no truncation
-                #         f.write(str(images[i].cpu().numpy()) + "\n")
-                #     exit(0)
+
                     
     # Calculate metrics
     val_loss = epoch_loss / len(loader)
@@ -1432,12 +1396,7 @@ def main(encoder_type, decoder_type, resume=False):
         PAD_TOKEN
     )
 
-    # print the first batch of test_loader for verification
-    # for _, formulas in test_loader:
-    #     for f in formulas[:20]:
-    #         print(tokenizer.inverse_transform(f.cpu().numpy()))
-    #         print("-----")
-        # exit(0)
+
     print("Initializing model...")
     # Initialize models
     if encoder_type == "cnn_encoder":
@@ -1484,7 +1443,7 @@ def main(encoder_type, decoder_type, resume=False):
             embedding_dim=EMBEDDING_DIM,
             decoder_hidden_dim=DECODER_HIDDEN_DIM,
             encoder_dim=detected_encoder_dim,
-            dropout_p=0.1
+            dropout_p=DROPOUT
         ).to(DEVICE)
         if resume:
             decoder_lr=1e-4
@@ -1505,7 +1464,7 @@ def main(encoder_type, decoder_type, resume=False):
             num_heads=NUM_HEADS,
             num_layers=NUM_LAYERS,
             max_len=MAX_SEQ_LEN,
-            dropout_p=0.3
+            dropout_p=0.1
         ).to(DEVICE)
         if resume:
             decoder_lr = 5e-5
@@ -1514,7 +1473,11 @@ def main(encoder_type, decoder_type, resume=False):
     else:
         raise ValueError("Unsupported decoder type")
 
-    model = Im2LatexModel(encoder, decoder, resume, postfix=f"_small_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}").to(DEVICE)
+    postfix = f"_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}"
+
+    model = Im2LatexModel(encoder, decoder, resume, postfix=postfix).to(DEVICE)
+
+    checkpoint_path = f"im2latex_best_model_{model.module if isinstance(model, nn.DataParallel) else model}{postfix}.pth"
 
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs!")
@@ -1540,9 +1503,9 @@ def main(encoder_type, decoder_type, resume=False):
             mode='max',  # Monitor val BLEU + EM - NED
             # mode='min', # Monitor val loss
             factor=0.5,  
-            patience=4,
-            cooldown=2,
-            min_lr=[1e-6, 1e-6]
+            patience=3,
+            cooldown=1,
+            min_lr=[1e-7, 1e-7]
         )
     else:
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -1634,7 +1597,7 @@ def main(encoder_type, decoder_type, resume=False):
             best_ned = min(best_ned, val_ned)
             
             model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-            torch.save(model_to_save.state_dict(), f"im2latex_best_model_{model_to_save}_small_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth")
+            torch.save(model_to_save.state_dict(), checkpoint_path)
 
             epochs_no_improve = 0
         else:
@@ -1648,7 +1611,7 @@ def main(encoder_type, decoder_type, resume=False):
     # load the best model for final evaluation
     print("Loading best model for final evaluation on test set...")
     model_to_load = model.module if isinstance(model, nn.DataParallel) else model
-    model_to_load.load_state_dict(torch.load(f"im2latex_best_model_{model_to_load}_small_max-tfr-{MAX_TEACHER_FORCING_RATIO}_min-tfr-{MIN_TEACHER_FORCING_RATIO}.pth", map_location=DEVICE))
+    model_to_load.load_state_dict(torch.load(checkpoint_path, map_location=DEVICE))
     test_loss, test_bleu, test_em, test_ned = evaluate(
         model,
         test_loader,
@@ -1666,9 +1629,6 @@ def main(encoder_type, decoder_type, resume=False):
     test_record["em"].append(test_em)
     test_record["ned"].append(test_ned)
 
-        # Save a checkpoint
-        # if epoch % 10 == 0:
-        #     torch.save(model.state_dict(), f"im2latex_baseline_epoch_{epoch}.pth")
 
     print("\nTraining complete.")
     # save training/validation/test records to a single json file
@@ -1686,10 +1646,10 @@ if __name__ == "__main__":
         print(f"Dataset not found in '{DATA_DIR}'.")
         print("Please follow the prerequisite steps to download and unzip the dataset.")
     else:
-        # main("resnet_encoder", "attention_decoder", resume=True)
+        main("resnet_encoder", "attention_decoder", resume=False)
         # main("resnet_encoder", "lstm_decoder", resume=True)
         # main("cnn_encoder", "lstm_decoder", resume=True)
         # main("cnn_encoder", "attention_decoder", resume=True)
         # main("vit_encoder", "attention_decoder", resume=True)
         # main("vit_encoder", "lstm_decoder", resume=True)
-        main("resnet_encoder", "transformer_decoder", resume=True)
+        main("resnet_encoder", "transformer_decoder", resume=False)
