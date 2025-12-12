@@ -1,5 +1,3 @@
-# Install dependencies:
-# pip install torch torchvision pandas numpy pillow nltk tqdm scikit-learn
 import json
 import os
 import re

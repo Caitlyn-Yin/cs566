@@ -40,7 +40,7 @@ try:
         CNNEncoder, ResNetEncoder, ViTEncoder,
         AttentionDecoder, LSTMDecoder, TransformerDecoder,
         Im2LatexModel, Tokenizer, ResizeAndPad,
-        get_image_size, normalize_latex
+        get_image_size, normalize_latex, beam_search_decode
     )
     # print("Successfully imported model classes from main.py")
 except ImportError:
@@ -127,7 +127,7 @@ def load_model(model_path):
             decoder_hidden_dim=DECODER_HIDDEN_DIM,
             encoder_dim=encoder_dim,
             attention_dim=ATTENTION_DIM,
-            dropout_p=0.3
+            dropout_p=0
         ).to(DEVICE)
     elif "lstm" in model_path.lower():
         decoder = LSTMDecoder(
@@ -135,7 +135,7 @@ def load_model(model_path):
             embedding_dim=EMBEDDING_DIM,
             decoder_hidden_dim=DECODER_HIDDEN_DIM,
             encoder_dim=encoder_dim,
-            dropout_p=0.3
+            dropout_p=0
         ).to(DEVICE)
     elif "transformer" in model_path.lower():
         # Transformer Parameters
@@ -150,7 +150,7 @@ def load_model(model_path):
             num_heads=NUM_HEADS,
             num_layers=NUM_LAYERS,
             max_len=MAX_SEQ_LEN,
-            dropout_p=0.3
+            dropout_p=0
         ).to(DEVICE)
         
 
@@ -185,105 +185,12 @@ def process_image(image_path, encoder_type):
     return img_tensor
 
 def predict(model, image_tensor, tokenizer):
-    import math
-    with torch.no_grad():
-        # Encoder pass
-        encoder_out = model.encoder(image_tensor)
-        
-        B = image_tensor.size(0)
-        max_len = 150 # Max length for generated formula
-        
-        decoded_indices = []
-        
-        if isinstance(model.decoder, TransformerDecoder):
-            # --- Transformer Inference ---
-            # 1. Project Encoder Output
-            memory = model.decoder.encoder_proj(encoder_out)
+    
+    decoded_indices = beam_search_decode(model, image_tensor, beam_width=5, max_len=MAX_SEQ_LEN)
             
-            # 2. Start with SOS
-            generated_seq = torch.tensor([[SOS_TOKEN]] * B).to(DEVICE) # (B, 1)
-            
-            for t in range(max_len):
-                # Prepare input for this step
-                tgt_emb = model.decoder.embedding(generated_seq)
-                tgt_emb *= math.sqrt(model.decoder.decoder_hidden_dim)
-                tgt_emb = model.decoder.pos_encoder(tgt_emb)
-                
-                tgt_mask = model.decoder.generate_square_subsequent_mask(generated_seq.size(1), DEVICE)
-                
-                # Transformer Decoder Pass
-                # output: (B, seq_len, dim)
-                trans_out = model.decoder.transformer_decoder(
-                    tgt=tgt_emb, 
-                    memory=memory, 
-                    tgt_mask=tgt_mask
-                )
-                
-                # Get last token output
-                last_token_out = trans_out[:, -1, :] # (B, dim)
-                logits = model.decoder.fc_out(last_token_out) # (B, vocab)
-                
-                # Greedy
-                pred_token = logits.argmax(1) # (B,)
-                token_idx = pred_token.item()
-                
-                if token_idx == EOS_TOKEN:
-                    break
-                
-                decoded_indices.append(token_idx)
-                
-                # Append to sequence for next step
-                generated_seq = torch.cat([generated_seq, pred_token.unsqueeze(1)], dim=1)
-
-        else:
-            # --- RNN Inference ---
-            # Initialize hidden state
-            if hasattr(model.decoder, 'init_hidden_state'):
-                h, c = model.decoder.init_hidden_state(encoder_out)
-            else:
-                # Fallback if method name differs
-                mean_encoder_out = encoder_out.mean(dim=1)
-                h = model.decoder.tanh(model.decoder.init_h(mean_encoder_out))
-                c = model.decoder.tanh(model.decoder.init_c(mean_encoder_out))
-                
-            # Start token
-            input_token = torch.tensor([SOS_TOKEN] * B).to(DEVICE)
-            
-            for t in range(max_len):
-                # Embed
-                if hasattr(model.decoder, 'embedding_dropout'):
-                     embedded = model.decoder.embedding_dropout(model.decoder.embedding(input_token))
-                else:
-                     embedded = model.decoder.embedding(input_token)
-
-                # Step
-                if isinstance(model.decoder, AttentionDecoder):
-                    context, alpha = model.decoder.attention(encoder_out, h)
-                    lstm_input = torch.cat((embedded, context), dim=1)
-                    h, c = model.decoder.lstm_cell(lstm_input, (h, c))
-                else:
-                    # LSTM Decoder
-                    h, c = model.decoder.lstm_cell(embedded, (h, c))
-                    
-                # Output
-                if hasattr(model.decoder, 'fc_dropout'):
-                    output = model.decoder.fc_dropout(model.decoder.fc_out(h))
-                else:
-                    output = model.decoder.fc_out(h)
-                
-                # Greedy argmax
-                pred_token = output.argmax(1)
-                
-                token_idx = pred_token.item()
-                if token_idx == EOS_TOKEN:
-                    break
-                    
-                decoded_indices.append(token_idx)
-                input_token = pred_token
-            
-        # Convert indices to string
-        latex_str = tokenizer.inverse_transform(decoded_indices)
-        return latex_str
+    # Convert indices to string
+    latex_str = tokenizer.inverse_transform(decoded_indices[0])
+    return latex_str
 
 def main():
     print("--- Im2Latex Demo ---")

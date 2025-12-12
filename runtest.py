@@ -5,7 +5,7 @@ import torch.nn as nn
 import argparse
 
 from main import (
-    DATA_DIR, TEST_PT_PATH, BATCH_SIZE, NUM_WORKERS, PAD_TOKEN,
+    DATA_DIR, TEST_PT_PATH, BATCH_SIZE, NUM_WORKERS, PAD_TOKEN, MAX_SEQ_LEN,
     EMBEDDING_DIM, DECODER_HIDDEN_DIM, ATTENTION_DIM, DROPOUT, DEVICE,
     Tokenizer, PreprocessedIm2LatexDataset, CollateFn,
     CNNEncoder, ResNetEncoder, ViTEncoder,
@@ -39,7 +39,7 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
     collate_fn = CollateFn(PAD_TOKEN)
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=BATCH_SIZE // 2,
         shuffle=False,
         num_workers=NUM_WORKERS,
         pin_memory=True,
@@ -48,11 +48,11 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
 
     # 3. Initialize Model
     print("Initializing model...")
-    if encoder_type == "cnn_encoder":
+    if encoder_type == "cnn":
         encoder = CNNEncoder(encoded_image_size=16).to(DEVICE)
-    elif encoder_type == "resnet_encoder":
+    elif encoder_type == "resnet":
         encoder = ResNetEncoder(encoded_image_size=16).to(DEVICE)
-    elif encoder_type == "vit_encoder":
+    elif encoder_type == "vit":
         encoder = ViTEncoder().to(DEVICE)
     else:
         raise ValueError(f"Unsupported encoder type: {encoder_type}")
@@ -65,7 +65,7 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
     encoder_dim = enc_out.shape[2]
     print(f"Encoder output dimension: {encoder_dim}")
 
-    if decoder_type == "attention_decoder":
+    if decoder_type == "attention":
         decoder = AttentionDecoder(
             vocab_size=vocab_size,
             embedding_dim=EMBEDDING_DIM,
@@ -74,7 +74,7 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
             attention_dim=ATTENTION_DIM,
             dropout_p=0 # No dropout during evaluation
         ).to(DEVICE)
-    elif decoder_type == "lstm_decoder":
+    elif decoder_type == "lstm":
         decoder = LSTMDecoder(
             vocab_size=vocab_size,
             embedding_dim=EMBEDDING_DIM,
@@ -82,13 +82,14 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
             encoder_dim=encoder_dim,
             dropout_p=0
         ).to(DEVICE)
-    elif decoder_type == "transformer_decoder":
+    elif decoder_type == "transformer":
          decoder = TransformerDecoder(
             vocab_size=vocab_size,
-            decoder_hidden_dim=DECODER_HIDDEN_DIM, 
+            decoder_hidden_dim=256, 
             encoder_dim=encoder_dim,
             num_heads=8, # Matching main.py default
             num_layers=3, # Matching main.py default
+            max_len=MAX_SEQ_LEN,
             dropout_p=0
         ).to(DEVICE)
     else:
@@ -141,7 +142,8 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
         model,
         test_loader,
         criterion,
-        tokenizer
+        tokenizer,
+        beamer_width=5
     )
 
     results = {
@@ -164,9 +166,9 @@ def test(encoder_type, decoder_type, checkpoint_path=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run evaluation on the test set.")
-    parser.add_argument("--encoder", type=str, required=True, help="cnn_encoder, resnet_encoder, vit_encoder")
-    parser.add_argument("--decoder", type=str, required=True, help="lstm_decoder, attention_decoder, transformer_decoder")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint file (optional)")
+    parser.add_argument("--encoder", "-en", type=str, required=True, help="cnn, resnet, vit")
+    parser.add_argument("--decoder", "-de", type=str, required=True, help="lstm, attention, transformer")
+    parser.add_argument("--checkpoint", "-cp", type=str, default=None, help="Path to checkpoint file (optional)")
     
     args = parser.parse_args()
     
