@@ -92,7 +92,7 @@
         }
 
         section {
-            padding: 50px 2rem;
+            padding: 30px 2rem; 
             max-width: 900px;
             margin: 0 auto;
         }
@@ -243,6 +243,7 @@
             <div class="nav-links">
                 <a href="#motivation">Motivation</a>
                 <a href="#methodology">Methodology</a>
+                <a href="#demo">Demo</a>
                 <a href="#results">Results</a>
                 <a href="#future">Future Work</a>
             </div>
@@ -251,7 +252,7 @@
 
     <div class="project-hero">
         <h1>LaTeX Equation OCR</h1>
-        <div class="subtitle">From Equation Images to Structured LaTeX</div>
+        <div class="subtitle">From Equation Images to Structured \(\LaTeX\)</div>
         
         <div class="authors">
             <span class="author-name">Yujie Ding</span>
@@ -273,7 +274,7 @@
         <div class="example-box">
             <div class="example-item">
                 <h4>Input Image</h4>
-                <div style="font-size: 1.5rem; margin: 10px;">$\int_{-\infty}^{\infty} e^{-ax^2} dx$</div>
+                <div style="font-size: 1.5rem; margin: 10px;">$$\int_{-\infty}^{\infty} e^{-ax^2} dx$$</div>
             </div>
             <div class="example-item">
                 <h4>Standard OCR (Fail)</h4>
@@ -292,30 +293,77 @@
             Our system uses an image-to-sequence translation model trained on the <strong>IM2LaTeX-100K</strong> dataset (~100k equation images). The architecture consists of three main stages:
         </p>
 
-        <div class="pipeline-steps">
-            <div class="step">Input Image<br><small>(Grayscale, Resized)</small></div>
+        <div style="display: flex; justify-content: center; overflow-x: visible; margin: 30px 0;">
+            <div class="pipeline-steps" style="flex-wrap: nowrap; min-width: max-content;">
+            <div class="step" style="padding: 8px 0px;">Input Image<br><small style="font-size: 0.7rem;">(Grayscale, Resized)</small></div>
             <div class="arrow">&#8594;</div>
-            <div class="step">Encoder<br><small>(CNN or ResNet)</small></div>
+            <div class="step" style="padding: 8px 0px;">Encoder<br><small style="font-size: 0.7rem;">(CNN or ResNet)</small></div>
             <div class="arrow">&#8594;</div>
-            <div class="step">Embedding<br><small>(Feature Grid)</small></div>
+            <div class="step" style="padding: 8px 0px;">Embedding<br><small style="font-size: 0.7rem;">(Feature Vector)</small></div>
             <div class="arrow">&#8594;</div>
-            <div class="step">Decoder<br><small>(LSTM + Attention)</small></div>
+            <div class="step" style="padding: 8px 0px;">Decoder<br><small style="font-size: 0.7rem;">(LSTM + Attention)</small></div>
             <div class="arrow">&#8594;</div>
-            <div class="step">Output LaTeX<br><small>(Sequence)</small></div>
+            <div class="step" style="padding: 8px 0px;">Output LaTeX<br><small style="font-size: 0.7rem;">(Sequence)</small></div>
+            </div>
         </div>
 
         <h3>Key Components</h3>
         <ul>
-            <li><strong>Encoder:</strong> We experimented with both a standard CNN and a ResNet-34 backbone to extract feature grids from the raw images.</li>
+            <li><strong>Encoder:</strong> We experimented with a standard CNN, a ResNet-34 backbone and a Vision Transformer (ViT) base backbone to extract feature grids from the raw images.</li>
             <li><strong>Decoder:</strong> We compared a standard LSTM against an <strong>Attention-based LSTM</strong>. The attention mechanism allows the decoder to "look at" specific regions of the image (e.g., the numerator of a fraction) while generating the corresponding token.</li>
             <li><strong>Metrics:</strong> Performance was measured using BLEU-4, Exact Match (EM), and Normalized Edit Distance (NED).</li>
         </ul>
+        <p>
+            The full source code for this project is available on GitHub: 
+            <a href="https://github.com/Caitlyn-Yin/cs566" target="_blank" style="color: var(--primary-color); text-decoration: underline;">https://github.com/Caitlyn-Yin/cs566</a>
+        </p>
+    </section>
+
+    <section id="demo">
+        <h2 class="section-title">Live Demo</h2>
+        <p>
+            Try our model yourself! Upload an image of a mathematical equation that is rendered by \(\LaTeX\), and our model will generate the corresponding LaTeX code.
+        </p>
+        
+        <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px; background: #fff;">
+            <div style="margin-bottom: 20px; text-align: center;">
+                <input type="file" id="imageInput" accept="image/*" style="display: none;" onchange="previewImage(event)">
+                <label for="imageInput" style="cursor: pointer; background: var(--secondary-color); color: #fff; padding: 10px 20px; border-radius: 4px; display: inline-block;">
+                    Choose Image
+                </label>
+                <div id="previewContainer" style="margin-top: 15px; display: none;">
+                    <img id="imagePreview" src="" alt="Preview" style="max-width: 100%; max-height: 200px; border: 1px solid #eee;">
+                </div>
+            </div>
+
+            <button onclick="runInference()" style="width: 100%; padding: 12px; background: var(--primary-color); color: #fff; border: none; border-radius: 4px; font-size: 1rem; cursor: pointer; font-weight: bold;">
+                Generate LaTeX
+            </button>
+
+            <div id="loading" style="display: none; text-align: center; margin-top: 15px; color: #666;">
+                Processing... (this may take a few seconds)
+            </div>
+
+            <div id="resultContainer" style="margin-top: 20px; display: none;">
+                <h4 style="margin-bottom: 5px;">Generated LaTeX:</h4>
+                <div style="position: relative;">
+                    <pre id="latexOutput" style="background: #f4f4f4; padding: 15px; border-radius: 4px; overflow-x: auto; font-family: monospace; border: 1px solid #ddd; margin: 0;"></pre>
+                    <button onclick="copyToClipboard()" style="position: absolute; top: 5px; right: 5px; background: #fff; border: 1px solid #ccc; padding: 2px 8px; font-size: 0.8rem; cursor: pointer; border-radius: 3px;">Copy</button>
+                </div>
+                
+                <h4 style="margin-top: 15px; margin-bottom: 5px;">Rendered Equation:</h4>
+                <div id="renderedMath" style="font-size: 1.2rem; padding: 10px; border: 1px solid #eee; text-align: center; min-height: 50px; display: flex; align-items: center; justify-content: center;"></div>
+            </div>
+            
+            <div id="errorMsg" style="color: #c0392b; margin-top: 15px; display: none; text-align: center;"></div>
+        </div>
     </section>
 
     <section id="results">
         <h2 class="section-title">Experimental Results</h2>
         <p>
-            We conducted a comparative analysis between different Encoders (CNN vs. ResNet) and Decoders (Standard LSTM vs. Attention). The results clearly show that <strong>Attention dramatically improves structural accuracy</strong>.
+            We conducted a comparative analysis between different Encoders (CNN, ResNet, ViT) and Decoders (LSTM with/without Attention). The results clearly show that <strong>Attention dramatically improves structural accuracy</strong>.
+
         </p>
 
         <div class="table-container">
@@ -332,36 +380,53 @@
                 </thead>
                 <tbody>
                     <tr>
+                        <td>ViT</td>
+                        <td>LSTM</td>
+                        <td>1.9137</td>
+                        <td>0.0998</td>
+                        <td>0.0000</td>
+                        <td>0.7569</td>
+                    </tr>
+                    <tr>
                         <td>CNN</td>
                         <td>LSTM</td>
-                        <td>3.5426</td>
-                        <td>0.3622</td>
-                        <td>0.0027</td>
-                        <td>0.5087</td>
+                        <td>2.4953</td>
+                        <td>0.3830</td>
+                        <td>0.0014</td>
+                        <td>0.5357</td>
                     </tr>
+                    
                     <tr>
                         <td>ResNet</td>
                         <td>LSTM</td>
-                        <td>3.9982</td>
-                        <td>0.4098</td>
-                        <td>0.0098</td>
-                        <td>0.4385</td>
+                        <td>1.9833</td>
+                        <td>0.4990</td>
+                        <td>0.0475</td>
+                        <td>0.3034</td>
+                    </tr>
+                    <tr>
+                        <td>ViT</td>
+                        <td>Attention</td>
+                        <td>1.1275</td>
+                        <td>0.5490</td>
+                        <td>0.0621</td>
+                        <td>0.2552</td>
                     </tr>
                     <tr>
                         <td>CNN</td>
                         <td>Attention</td>
-                        <td>3.7866</td>
-                        <td>0.6563</td>
-                        <td>0.1824</td>
-                        <td>0.1822</td>
+                        <td>1.5159</td>
+                        <td>0.7310</td>
+                        <td>0.2171</td>
+                        <td>0.1710</td>
                     </tr>
                     <tr style="background-color: #eafaf1;">
                         <td><strong>ResNet</strong></td>
                         <td><strong>Attention</strong></td>
-                        <td><strong>3.1955</strong></td>
-                        <td><strong class="highlight">0.7695</strong></td>
-                        <td><strong class="highlight">0.3055</strong></td>
-                        <td><strong class="highlight">0.1148</strong></td>
+                        <td><strong>0.7597</strong></td>
+                        <td><strong class="highlight">0.8041</strong></td>
+                        <td><strong class="highlight">0.4123</strong></td>
+                        <td><strong class="highlight">0.0946</strong></td>
                     </tr>
                 </tbody>
             </table>
@@ -371,8 +436,9 @@
             <strong>Key Findings:</strong>
             <ul>
                 <li>The <strong>ResNet + Attention</strong> combination performed best across all metrics.</li>
-                <li>The Exact Match (EM) score jumped from <1% (Baseline) to nearly <strong>31%</strong> with Attention, proving its necessity for handling complex 2D structures.</li>
-                <li>Visual attention helps the model align its focus, significantly reducing the Normalized Edit Distance (NED) to 0.1148.</li>
+                <li>The Exact Match (EM) score jumped from <1% (Baseline) to nearly <strong>41%</strong> with Attention, proving its necessity for handling complex 2D structures.</li>
+                <li>Visual attention helps the model align its focus, significantly reducing the Normalized Edit Distance (NED) to 0.0977.</li>
+                <li>Interestingly, the <strong>ViT</strong> did not outperform the ResNet backbone. ViT underperformed due to its fixed \(224 \times 224\) input requirement, necessitating excessive padding that reduced resolution for rectangular text lines. Furthermore, processing images as patch sequences compromised the fine-grained spatial recognition essential for interpreting mathematical layout structure. </li>  
             </ul>
         </p>
     </section>
@@ -391,8 +457,84 @@
     </section>
 
     <footer>
-        &copy; 2025 CS566 Computer Vision Group. University of Wisconsin-Madison.
+        &copy; 2025 CS566 Computer Vision Group Project. University of Wisconsin-Madison.
     </footer>
 
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script>
+        // const API_URL = "http://127.0.0.1:8000/predict";
+        const API_URL = "https://distrustingly-unmaltable-scotty.ngrok-free.dev/predict";
+
+        function previewImage(event) {
+            const file = event.target.files[0];
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const preview = document.getElementById('imagePreview');
+                    preview.src = e.target.result;
+                    document.getElementById('previewContainer').style.display = 'block';
+                    // Reset results
+                    document.getElementById('resultContainer').style.display = 'none';
+                    document.getElementById('errorMsg').style.display = 'none';
+                }
+                reader.readAsDataURL(file);
+            }
+        }
+
+        async function runInference() {
+            const fileInput = document.getElementById('imageInput');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                alert("Please select an image first.");
+                return;
+            }
+
+            // UI Updates
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('resultContainer').style.display = 'none';
+            document.getElementById('errorMsg').style.display = 'none';
+
+            const formData = new FormData();
+            formData.append('file', file);
+
+            try {
+                const response = await fetch(API_URL, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    const latex = data.latex || data.output_sequence; // Handle different key names
+                    document.getElementById('latexOutput').textContent = latex;
+                    
+                    // Render MathJax
+                    const mathContainer = document.getElementById('renderedMath');
+                    mathContainer.innerHTML = `$$${latex}$$`;
+                    MathJax.typesetPromise([mathContainer]);
+
+                    document.getElementById('resultContainer').style.display = 'block';
+                } else {
+                    throw new Error(data.error || "Server error");
+                }
+            } catch (error) {
+                const errorDiv = document.getElementById('errorMsg');
+                errorDiv.textContent = `Error: ${error.message}`;
+                errorDiv.style.display = 'block';
+            } finally {
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+
+        function copyToClipboard() {
+            const text = document.getElementById('latexOutput').textContent;
+            navigator.clipboard.writeText(text).then(() => {
+                alert("Copied to clipboard!");
+            });
+        }
+    </script>
 </body>
 </html>
